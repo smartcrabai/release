@@ -9,6 +9,22 @@ use crate::backends::workspace::child_package_jsons;
 
 pub struct Pnpm;
 
+/// Read a version from a `package.json` file, or `None` if no string
+/// `"version"` field is present.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read or parsed.
+pub fn read_package_json_version_opt(path: &Path) -> Result<Option<String>> {
+    let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let json: Value =
+        serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+    Ok(json
+        .get("version")
+        .and_then(Value::as_str)
+        .map(str::to_owned))
+}
+
 /// Read a version from a `package.json` file.
 ///
 /// # Errors
@@ -16,30 +32,31 @@ pub struct Pnpm;
 /// Returns an error when the file cannot be read or does not have a string
 /// `"version"` field.
 pub fn read_package_json_version(path: &Path) -> Result<String> {
-    let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let json: Value =
-        serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
-    json.get("version")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
+    read_package_json_version_opt(path)?
         .ok_or_else(|| anyhow!("no string \"version\" in {}", path.display()))
 }
 
 /// Write a new `version` into a `package.json` file while preserving the
-/// original formatting as much as is reasonable.
+/// original formatting as much as is reasonable. Silently skips files that
+/// do not currently have a string `"version"` field (e.g. a workspace root
+/// `package.json` with `"private": true`).
+///
+/// Returns `true` if the file was updated.
 ///
 /// # Errors
 ///
 /// Returns an error when the file cannot be read/written.
-pub fn write_package_json_version(path: &Path, new: &str) -> Result<()> {
+pub fn write_package_json_version_if_present(path: &Path, new: &str) -> Result<bool> {
     let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let json: Value =
         serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
-    let old = json
+    let Some(old) = json
         .get("version")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("no string \"version\" in {}", path.display()))?
-        .to_owned();
+        .map(str::to_owned)
+    else {
+        return Ok(false);
+    };
 
     // Replace the first `"version": "<old>"` occurrence (as an object member).
     // This preserves formatting of the rest of the file.
@@ -59,7 +76,69 @@ pub fn write_package_json_version(path: &Path, new: &str) -> Result<()> {
     };
 
     fs::write(path, replaced).with_context(|| format!("write {}", path.display()))?;
-    Ok(())
+    Ok(true)
+}
+
+/// Read the version from `<root>/package.json`, falling back to the first
+/// workspace child (returned by `children_fn`) that has one. Used by JS
+/// workspace backends where the root `package.json` is often private with no
+/// `version` field.
+///
+/// # Errors
+///
+/// Returns an error when no version can be found, or when IO/parsing fails.
+pub(crate) fn read_version_with_workspace_fallback(
+    root: &Path,
+    children_fn: impl FnOnce(&Path) -> Result<Vec<PathBuf>>,
+) -> Result<String> {
+    let pkg_path = root.join("package.json");
+    if let Some(v) = read_package_json_version_opt(&pkg_path)? {
+        return Ok(v);
+    }
+    for rel in children_fn(root)? {
+        if let Some(v) = read_package_json_version_opt(&root.join(&rel))? {
+            return Ok(v);
+        }
+    }
+    Err(anyhow!(
+        "no string \"version\" in {} or any workspace child",
+        pkg_path.display()
+    ))
+}
+
+/// Collect the `package.json` files that `write_version` would actually
+/// touch (i.e. those with an existing `"version"` field), under `root` and
+/// `children_fn(root)`. `workspace_kind` is used only in warning messages.
+pub(crate) fn files_to_stage_package_jsons(
+    root: &Path,
+    children_fn: impl FnOnce(&Path) -> Result<Vec<PathBuf>>,
+    workspace_kind: &str,
+) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = Vec::new();
+    match read_package_json_version_opt(&root.join("package.json")) {
+        Ok(Some(_)) => v.push(PathBuf::from("package.json")),
+        Ok(None) => {}
+        Err(e) => eprintln!(
+            "warning: failed to read root package.json at {}: {e}",
+            root.display()
+        ),
+    }
+    match children_fn(root) {
+        Ok(children) => {
+            for rel in children {
+                match read_package_json_version_opt(&root.join(&rel)) {
+                    Ok(Some(_)) => v.push(rel),
+                    Ok(None) => {}
+                    Err(e) => eprintln!("warning: failed to read {}: {e}", rel.display()),
+                }
+            }
+        }
+        Err(e) => eprintln!(
+            "warning: failed to expand {workspace_kind} workspace children at {}: {e}",
+            root.display()
+        ),
+    }
+    v
 }
 
 /// Parse the `packages:` list from a `pnpm-workspace.yaml` file.
@@ -137,13 +216,13 @@ impl Backend for Pnpm {
     }
 
     fn read_version(&self, root: &Path) -> Result<String> {
-        read_package_json_version(&root.join("package.json"))
+        read_version_with_workspace_fallback(root, pnpm_child_package_jsons)
     }
 
     fn write_version(&self, root: &Path, new: &str) -> Result<()> {
-        write_package_json_version(&root.join("package.json"), new)?;
+        write_package_json_version_if_present(&root.join("package.json"), new)?;
         for rel in pnpm_child_package_jsons(root)? {
-            write_package_json_version(&root.join(&rel), new)
+            write_package_json_version_if_present(&root.join(&rel), new)
                 .with_context(|| format!("update child manifest {}", rel.display()))?;
         }
         Ok(())
@@ -158,14 +237,7 @@ impl Backend for Pnpm {
     }
 
     fn files_to_stage(&self, root: &Path) -> Vec<PathBuf> {
-        let mut v = vec![PathBuf::from("package.json")];
-        match pnpm_child_package_jsons(root) {
-            Ok(children) => v.extend(children),
-            Err(e) => eprintln!(
-                "warning: failed to expand pnpm workspace children at {}: {e}",
-                root.display()
-            ),
-        }
+        let mut v = files_to_stage_package_jsons(root, pnpm_child_package_jsons, "pnpm");
         if root.join("pnpm-lock.yaml").is_file() {
             v.push(PathBuf::from("pnpm-lock.yaml"));
         }
@@ -196,7 +268,7 @@ mod tests {
             "{\n  \"name\": \"demo\",\n  \"version\": \"2.3.4\"\n}\n",
         )?;
         assert_eq!(read_package_json_version(&path)?, "2.3.4");
-        write_package_json_version(&path, "3.0.0")?;
+        write_package_json_version_if_present(&path, "3.0.0")?;
         let after = fs::read_to_string(&path)?;
         assert!(after.contains("\"version\": \"3.0.0\""));
         assert!(after.contains("\"name\": \"demo\""));
@@ -208,7 +280,7 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let path = tmp.path().join("package.json");
         fs::write(&path, "{\"name\":\"demo\",\"version\":\"1.0.0\"}")?;
-        write_package_json_version(&path, "1.0.1")?;
+        write_package_json_version_if_present(&path, "1.0.1")?;
         let after = fs::read_to_string(&path)?;
         assert!(after.contains("\"version\":\"1.0.1\""));
         Ok(())
@@ -274,6 +346,52 @@ mod tests {
 
         let staged = backend.files_to_stage(root);
         assert!(staged.contains(&PathBuf::from("package.json")));
+        assert!(staged.contains(&PathBuf::from("packages/a/package.json")));
+        assert!(staged.contains(&PathBuf::from("packages/b/package.json")));
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_root_without_version_reads_from_child() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+
+        fs::write(
+            root.join("package.json"),
+            "{\n  \"name\": \"root\",\n  \"private\": true\n}\n",
+        )?;
+        fs::write(
+            root.join("pnpm-workspace.yaml"),
+            "packages:\n  - \"packages/*\"\n",
+        )?;
+        fs::create_dir_all(root.join("packages/a"))?;
+        fs::create_dir_all(root.join("packages/b"))?;
+        fs::write(
+            root.join("packages/a/package.json"),
+            "{ \"name\": \"@x/a\", \"version\": \"1.2.3\" }\n",
+        )?;
+        fs::write(
+            root.join("packages/b/package.json"),
+            "{ \"name\": \"@x/b\", \"version\": \"1.2.3\" }\n",
+        )?;
+
+        let backend = Pnpm;
+        assert_eq!(backend.read_version(root)?, "1.2.3");
+
+        backend.write_version(root, "1.3.0")?;
+        let root_after = fs::read_to_string(root.join("package.json"))?;
+        assert!(!root_after.contains("\"version\""));
+        assert_eq!(
+            read_package_json_version(&root.join("packages/a/package.json"))?,
+            "1.3.0"
+        );
+        assert_eq!(
+            read_package_json_version(&root.join("packages/b/package.json"))?,
+            "1.3.0"
+        );
+
+        let staged = backend.files_to_stage(root);
+        assert!(!staged.contains(&PathBuf::from("package.json")));
         assert!(staged.contains(&PathBuf::from("packages/a/package.json")));
         assert!(staged.contains(&PathBuf::from("packages/b/package.json")));
         Ok(())

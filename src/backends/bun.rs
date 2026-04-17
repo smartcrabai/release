@@ -5,7 +5,10 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 
 use crate::backend::Backend;
-use crate::backends::pnpm::{read_package_json_version, write_package_json_version};
+use crate::backends::pnpm::{
+    files_to_stage_package_jsons, read_version_with_workspace_fallback,
+    write_package_json_version_if_present,
+};
 use crate::backends::workspace::child_package_jsons;
 
 pub struct Bun;
@@ -51,13 +54,13 @@ impl Backend for Bun {
     }
 
     fn read_version(&self, root: &Path) -> Result<String> {
-        read_package_json_version(&root.join("package.json"))
+        read_version_with_workspace_fallback(root, bun_child_package_jsons)
     }
 
     fn write_version(&self, root: &Path, new: &str) -> Result<()> {
-        write_package_json_version(&root.join("package.json"), new)?;
+        write_package_json_version_if_present(&root.join("package.json"), new)?;
         for rel in bun_child_package_jsons(root)? {
-            write_package_json_version(&root.join(&rel), new)
+            write_package_json_version_if_present(&root.join(&rel), new)
                 .with_context(|| format!("update child manifest {}", rel.display()))?;
         }
         Ok(())
@@ -72,14 +75,7 @@ impl Backend for Bun {
     }
 
     fn files_to_stage(&self, root: &Path) -> Vec<PathBuf> {
-        let mut v = vec![PathBuf::from("package.json")];
-        match bun_child_package_jsons(root) {
-            Ok(children) => v.extend(children),
-            Err(e) => eprintln!(
-                "warning: failed to expand bun workspace children at {}: {e}",
-                root.display()
-            ),
-        }
+        let mut v = files_to_stage_package_jsons(root, bun_child_package_jsons, "bun");
         if root.join("bun.lock").is_file() {
             v.push(PathBuf::from("bun.lock"));
         }
@@ -103,6 +99,7 @@ mod tests {
     use anyhow::Result;
 
     use super::*;
+    use crate::backends::pnpm::read_package_json_version;
 
     #[test]
     fn roundtrip() -> Result<()> {
@@ -186,6 +183,37 @@ mod tests {
             read_package_json_version(&root.join("packages/b/package.json"))?,
             "0.7.0"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_root_without_version_reads_from_child() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+
+        fs::write(
+            root.join("package.json"),
+            "{\n  \"name\": \"root\",\n  \"private\": true,\n  \"workspaces\": [\"packages/*\"]\n}\n",
+        )?;
+        fs::create_dir_all(root.join("packages/a"))?;
+        fs::write(
+            root.join("packages/a/package.json"),
+            "{ \"name\": \"@x/a\", \"version\": \"0.4.0\" }\n",
+        )?;
+
+        let backend = Bun;
+        assert_eq!(backend.read_version(root)?, "0.4.0");
+        backend.write_version(root, "0.4.1")?;
+        let root_after = fs::read_to_string(root.join("package.json"))?;
+        assert!(!root_after.contains("\"version\""));
+        assert_eq!(
+            read_package_json_version(&root.join("packages/a/package.json"))?,
+            "0.4.1"
+        );
+
+        let staged = backend.files_to_stage(root);
+        assert!(!staged.contains(&PathBuf::from("package.json")));
+        assert!(staged.contains(&PathBuf::from("packages/a/package.json")));
         Ok(())
     }
 
