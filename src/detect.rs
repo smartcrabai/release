@@ -13,7 +13,7 @@ use crate::cli::BackendName;
 /// 4. `package.json` + (`bun.lock` or `bun.lockb`) -> bun
 /// 5. `package.json` alone -> pnpm (fallback)
 /// 6. `Project.toml` containing `uuid` and `version` -> julia
-/// 7. `*.csproj` / `*.fsproj` / `Directory.Build.props` -> dotnet
+/// 7. `*.sln` / `*.csproj` / `*.fsproj` / `Directory.Build.props` -> dotnet
 /// 8. `go.mod` -> go
 ///
 /// # Errors
@@ -80,7 +80,10 @@ fn has_dotnet_project(root: &Path) -> Result<bool> {
         let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
             continue;
         };
-        if ext.eq_ignore_ascii_case("csproj") || ext.eq_ignore_ascii_case("fsproj") {
+        if ext.eq_ignore_ascii_case("csproj")
+            || ext.eq_ignore_ascii_case("fsproj")
+            || ext.eq_ignore_ascii_case("sln")
+        {
             return Ok(true);
         }
     }
@@ -192,6 +195,14 @@ mod tests {
     fn detects_dotnet_directory_build_props() -> Result<()> {
         let tmp = tempfile::tempdir()?;
         write(tmp.path(), "Directory.Build.props", "<Project></Project>")?;
+        assert_eq!(detect(tmp.path())?, BackendName::Dotnet);
+        Ok(())
+    }
+
+    #[test]
+    fn detects_dotnet_sln() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        write(tmp.path(), "Solution.sln", "")?;
         assert_eq!(detect(tmp.path())?, BackendName::Dotnet);
         Ok(())
     }

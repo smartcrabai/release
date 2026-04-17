@@ -28,8 +28,26 @@ The positional argument defaults to `patch`.
 | pnpm    | `package.json` + `pnpm-lock.yaml` (or `package.json` alone as fallback) | `"version"` in `package.json`      | `pnpm install --lockfile-only` | `pnpm publish --no-git-checks`              |
 | bun     | `package.json` + `bun.lock` or `bun.lockb`            | `"version"` in `package.json`                   | `bun install`                | `bun publish`                                 |
 | julia   | `Project.toml` containing `uuid` and `version`        | top-level `version`                             | — (Manifest is your problem) | — (no-op)                                     |
-| dotnet  | `*.csproj` / `*.fsproj` / `Directory.Build.props`     | `<Version>...</Version>`                        | `dotnet restore`             | `dotnet pack -c Release` (API key is yours)   |
+| dotnet  | `*.sln` / `*.csproj` / `*.fsproj` / `Directory.Build.props` | `<Version>...</Version>`                  | `dotnet restore`             | `dotnet pack -c Release` (API key is yours)   |
 | go      | `go.mod`                                              | — (tag only; previous tag is read from git)     | —                            | — (no-op; tags are the release)               |
+
+## Workspace / monorepo support
+
+For projects that define multiple packages in a single repository the tool
+updates every member's version in lockstep with the root version — reading
+only the root version and writing the new version to every discovered member
+manifest. Glob patterns use single-segment wildcards (`packages/*`,
+`crates/*`, …); `**` and `!`-negated patterns are skipped with a warning.
+
+| Backend | Workspace source                                             | Lockstep updates                                                    |
+| ------- | ------------------------------------------------------------ | ------------------------------------------------------------------- |
+| cargo   | `[workspace] members = [...]` (virtual or root-package)      | each member's `[package].version`; skipped when `[workspace.package].version` is used |
+| uv      | `[tool.uv.workspace] members = [...]` in root `pyproject.toml` | each member's `[project].version`                                 |
+| pnpm    | `pnpm-workspace.yaml` `packages:`                            | each member's `package.json` `"version"`                            |
+| bun     | `"workspaces"` array or object in root `package.json`        | each member's `package.json` `"version"`                            |
+| dotnet  | `Directory.Build.props` (centralized), `*.sln`, or recursive `*.csproj`/`*.fsproj` discovery | `<Version>` in each project file (no-op for projects lacking the element); central `Directory.Build.props` updates only that file |
+| go      | — (no version files; the git tag is the release)             | — (not applicable)                                                  |
+| julia   | — (no standard workspace layout)                             | — (not applicable)                                                  |
 
 ## Git workflow
 

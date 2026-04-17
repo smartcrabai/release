@@ -1,8 +1,9 @@
-//! Shared helpers for JS monorepo-style workspaces (pnpm / bun).
+//! Shared helpers for monorepo-style workspaces.
 //!
 //! A workspace is described by a list of glob patterns pointing at package
-//! directories. Each directory that matches a pattern is expected to contain a
-//! `package.json`, which is updated in lockstep with the root manifest.
+//! directories. Each directory that matches a pattern is expected to contain
+//! a well-known manifest file (e.g. `package.json`, `Cargo.toml`,
+//! `pyproject.toml`), which is updated in lockstep with the root manifest.
 //!
 //! The glob support here is deliberately simple: only a single-segment `*` /
 //! `?` / `[...]` is handled (as implemented by the `glob` crate), which is
@@ -14,18 +15,23 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-/// Return paths (relative to `root`) of every `package.json` reachable from
-/// the given workspace patterns, excluding the root `package.json` itself.
+/// Return paths (relative to `root`) of every member manifest named
+/// `manifest_name` reachable from the given workspace patterns.
 ///
 /// Patterns are interpreted relative to `root`. Non-directory matches and
-/// matches without a `package.json` are skipped silently. Duplicate matches
-/// (possible when patterns overlap) are deduplicated while preserving order.
+/// matches without the expected manifest are skipped silently. Duplicate
+/// matches (possible when patterns overlap) are deduplicated while
+/// preserving order.
 ///
 /// # Errors
 ///
-/// Returns an error when expanding a pattern fails with an unexpected I/O
-/// error. Invalid patterns themselves produce a warning and are skipped.
-pub fn child_package_jsons(root: &Path, patterns: &[String]) -> Result<Vec<PathBuf>> {
+/// Returns an error when joining `root` with a pattern produces a non-UTF-8
+/// path. Invalid patterns themselves produce a warning and are skipped.
+pub fn child_manifests(
+    root: &Path,
+    patterns: &[String],
+    manifest_name: &str,
+) -> Result<Vec<PathBuf>> {
     let mut out: Vec<PathBuf> = Vec::new();
     for raw in patterns {
         let pat = raw.trim();
@@ -67,17 +73,29 @@ pub fn child_package_jsons(root: &Path, patterns: &[String]) -> Result<Vec<PathB
             if !dir.is_dir() {
                 continue;
             }
-            let pkg = dir.join("package.json");
-            if !pkg.is_file() {
+            let manifest = dir.join(manifest_name);
+            if !manifest.is_file() {
                 continue;
             }
-            let rel = pkg.strip_prefix(root).unwrap_or(&pkg).to_path_buf();
+            let rel = manifest
+                .strip_prefix(root)
+                .unwrap_or(&manifest)
+                .to_path_buf();
             if !out.iter().any(|p| p == &rel) {
                 out.push(rel);
             }
         }
     }
     Ok(out)
+}
+
+/// Convenience wrapper for JS-style workspaces that use `package.json`.
+///
+/// # Errors
+///
+/// See [`child_manifests`].
+pub fn child_package_jsons(root: &Path, patterns: &[String]) -> Result<Vec<PathBuf>> {
+    child_manifests(root, patterns, "package.json")
 }
 
 #[cfg(test)]
@@ -145,6 +163,40 @@ mod tests {
         )?;
         assert_eq!(got.len(), 1);
         assert_eq!(got[0], PathBuf::from("packages/a/package.json"));
+        Ok(())
+    }
+
+    #[test]
+    fn child_manifests_works_with_cargo_toml() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        fs::create_dir_all(tmp.path().join("crates/a"))?;
+        fs::create_dir_all(tmp.path().join("crates/b"))?;
+        fs::write(tmp.path().join("crates/a/Cargo.toml"), "[package]\n")?;
+        fs::write(tmp.path().join("crates/b/Cargo.toml"), "[package]\n")?;
+
+        let got = child_manifests(tmp.path(), &["crates/*".into()], "Cargo.toml")?;
+        let mut got_strs: Vec<String> = got.iter().map(|p| p.display().to_string()).collect();
+        got_strs.sort();
+        assert_eq!(
+            got_strs,
+            vec![
+                "crates/a/Cargo.toml".to_owned(),
+                "crates/b/Cargo.toml".to_owned()
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn child_manifests_works_with_pyproject_toml() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        fs::create_dir_all(tmp.path().join("packages/a"))?;
+        fs::create_dir_all(tmp.path().join("packages/b"))?;
+        fs::write(tmp.path().join("packages/a/pyproject.toml"), "[project]\n")?;
+        fs::write(tmp.path().join("packages/b/pyproject.toml"), "[project]\n")?;
+
+        let got = child_manifests(tmp.path(), &["packages/*".into()], "pyproject.toml")?;
+        assert_eq!(got.len(), 2);
         Ok(())
     }
 }
