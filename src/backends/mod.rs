@@ -7,6 +7,7 @@ pub mod go;
 pub mod julia;
 pub mod pnpm;
 pub mod uv;
+pub mod workspace;
 
 use std::path::Path;
 use std::process::Command;
