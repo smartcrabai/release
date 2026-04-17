@@ -6,7 +6,7 @@ optionally publishes — across a handful of package managers.
 ## Usage
 
 ```sh
-release [patch|minor|major] [--no-publish] [--dry-run] [--backend <name>]
+release [patch|minor|major] [-P|--no-publish] [--dry-run] [--backend <name>]
 ```
 
 The positional argument defaults to `patch`.
@@ -15,7 +15,7 @@ The positional argument defaults to `patch`.
 
 | Flag            | Description                                                                |
 | --------------- | -------------------------------------------------------------------------- |
-| `--no-publish`  | Skip the publish step (existing `cargo-release` compatibility).            |
+| `-P`, `--no-publish` | Skip the publish step (existing `cargo-release` compatibility).       |
 | `--dry-run`     | Print the steps that would run without writing files or running commands. |
 | `--backend <n>` | Override auto-detection. One of `cargo`, `pnpm`, `bun`, `go`, `dotnet`, `julia`, `uv`. |
 

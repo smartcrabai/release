@@ -28,7 +28,7 @@ pub struct Cli {
     pub bump: BumpArg,
 
     /// Skip the publish step.
-    #[arg(long)]
+    #[arg(short = 'P', long)]
     pub no_publish: bool,
 
     /// Print the actions that would be performed without making any changes.
