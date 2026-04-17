@@ -3,6 +3,34 @@
 A small Rust CLI that bumps a project's version, commits, tags, pushes, and
 optionally publishes — across a handful of package managers.
 
+## Installation
+
+### Homebrew
+
+```sh
+brew install smartcrabai/tap/release
+```
+
+### Shell installer (macOS / Linux)
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/smartcrabai/release/releases/latest/download/release-installer.sh | sh
+```
+
+### Cargo
+
+```sh
+cargo install --git https://github.com/smartcrabai/release
+```
+
+### Prebuilt binaries
+
+Download the archive for your platform from the [GitHub Releases](https://github.com/smartcrabai/release/releases/latest) page. Supported targets:
+
+- `aarch64-apple-darwin`
+- `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`
+- `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`
+
 ## Usage
 
 ```sh
