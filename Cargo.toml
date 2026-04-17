@@ -22,7 +22,14 @@ targets = [
 ]
 
 [dependencies]
-tokio = { version = "1.52.1", features = ["rt", "macros"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+glob = "0.3"
+serde_json = "1"
+toml_edit = "0.22"
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 codegen-units = 1
