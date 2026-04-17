@@ -73,8 +73,12 @@ impl Backend for Bun {
 
     fn files_to_stage(&self, root: &Path) -> Vec<PathBuf> {
         let mut v = vec![PathBuf::from("package.json")];
-        if let Ok(children) = bun_child_package_jsons(root) {
-            v.extend(children);
+        match bun_child_package_jsons(root) {
+            Ok(children) => v.extend(children),
+            Err(e) => eprintln!(
+                "warning: failed to expand bun workspace children at {}: {e}",
+                root.display()
+            ),
         }
         if root.join("bun.lock").is_file() {
             v.push(PathBuf::from("bun.lock"));

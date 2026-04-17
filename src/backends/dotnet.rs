@@ -31,11 +31,23 @@ fn extract_version(text: &str) -> Option<String> {
 }
 
 fn replace_version(text: &str, old: &str, new: &str) -> Option<String> {
-    let needle = format!("<Version>{old}</Version>");
-    if !text.contains(&needle) {
+    let open_tag = "<Version>";
+    let close_tag = "</Version>";
+    let open = text.find(open_tag)?;
+    let after = open + open_tag.len();
+    let close_rel = text[after..].find(close_tag)?;
+    let inner = &text[after..after + close_rel];
+    if inner.trim() != old {
         return None;
     }
-    Some(text.replacen(&needle, &format!("<Version>{new}</Version>"), 1))
+    let end = after + close_rel + close_tag.len();
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..open]);
+    out.push_str(open_tag);
+    out.push_str(new);
+    out.push_str(close_tag);
+    out.push_str(&text[end..]);
+    Some(out)
 }
 
 /// Very small solution parser: extract the second quoted string on each
@@ -113,7 +125,11 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
         let Some(name_str) = file_name.to_str() else {
             continue;
         };
-        if path.is_dir() {
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
             if skip(name_str) {
                 continue;
             }
@@ -427,6 +443,18 @@ Project(\"{G}\") = \"B\", \"B/B.csproj\", \"{G2}\"\nEndProject\n";
         let staged = b.files_to_stage(root);
         assert!(staged.contains(&PathBuf::from("A/A.csproj")));
         assert!(!staged.contains(&PathBuf::from("B/B.csproj")));
+        Ok(())
+    }
+
+    #[test]
+    fn replace_version_tolerates_whitespace_inside_tags() -> Result<()> {
+        let text =
+            "<Project><PropertyGroup><Version>  1.2.3 \n</Version></PropertyGroup></Project>";
+        assert_eq!(extract_version(text).as_deref(), Some("1.2.3"));
+        let out = replace_version(text, "1.2.3", "1.2.4")
+            .ok_or_else(|| anyhow!("replace_version returned None"))?;
+        assert!(out.contains("<Version>1.2.4</Version>"));
+        assert!(!out.contains("1.2.3"));
         Ok(())
     }
 }

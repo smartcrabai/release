@@ -159,8 +159,12 @@ impl Backend for Pnpm {
 
     fn files_to_stage(&self, root: &Path) -> Vec<PathBuf> {
         let mut v = vec![PathBuf::from("package.json")];
-        if let Ok(children) = pnpm_child_package_jsons(root) {
-            v.extend(children);
+        match pnpm_child_package_jsons(root) {
+            Ok(children) => v.extend(children),
+            Err(e) => eprintln!(
+                "warning: failed to expand pnpm workspace children at {}: {e}",
+                root.display()
+            ),
         }
         if root.join("pnpm-lock.yaml").is_file() {
             v.push(PathBuf::from("pnpm-lock.yaml"));

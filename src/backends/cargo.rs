@@ -122,6 +122,41 @@ impl Cargo {
     fn member_manifests(root: &Path, members: &[String]) -> Result<Vec<PathBuf>> {
         child_manifests(root, members, "Cargo.toml")
     }
+
+    fn publish_each_member(root: &Path, members: &[String]) -> Result<()> {
+        for rel in Self::member_manifests(root, members)? {
+            let member_doc = Self::read_member_doc(&root.join(&rel))?;
+            let Some(name) = Self::package_name_from_doc(&member_doc) else {
+                eprintln!(
+                    "warning: skipping publish of {} (no [package].name)",
+                    rel.display()
+                );
+                continue;
+            };
+            super::run(root, "cargo", &["publish", "-p", &name])?;
+        }
+        Ok(())
+    }
+
+    fn member_publish_preview(root: &Path, members: &[String]) -> Result<Option<String>> {
+        let mut names: Vec<String> = Vec::new();
+        for rel in Self::member_manifests(root, members)? {
+            let member_doc = Self::read_member_doc(&root.join(&rel))?;
+            if let Some(n) = Self::package_name_from_doc(&member_doc) {
+                names.push(n);
+            }
+        }
+        if names.is_empty() {
+            Ok(Some("cargo publish".into()))
+        } else {
+            let joined = names
+                .iter()
+                .map(|n| format!("cargo publish -p {n}"))
+                .collect::<Vec<_>>()
+                .join(" && ");
+            Ok(Some(joined))
+        }
+    }
 }
 
 impl Backend for Cargo {
@@ -229,11 +264,22 @@ impl Backend for Cargo {
     fn files_to_stage(&self, root: &Path) -> Vec<PathBuf> {
         let mut v: Vec<PathBuf> = vec![PathBuf::from("Cargo.toml")];
 
-        if let Ok(doc) = Self::read_doc(root)
-            && let Layout::VirtualOrMembers { members } = Self::classify(&doc)
-            && let Ok(children) = Self::member_manifests(root, &members)
-        {
-            v.extend(children);
+        match Self::read_doc(root) {
+            Ok(doc) => {
+                if let Layout::VirtualOrMembers { members } = Self::classify(&doc) {
+                    match Self::member_manifests(root, &members) {
+                        Ok(children) => v.extend(children),
+                        Err(e) => eprintln!(
+                            "warning: failed to expand cargo workspace members at {}: {e}",
+                            root.display()
+                        ),
+                    }
+                }
+            }
+            Err(e) => eprintln!(
+                "warning: failed to read Cargo.toml at {}: {e}",
+                root.display()
+            ),
         }
 
         if root.join("Cargo.lock").is_file() {
@@ -246,28 +292,14 @@ impl Backend for Cargo {
         let doc = Self::read_doc(root)?;
         match Self::classify(&doc) {
             Layout::WorkspacePackage => {
-                let Some(name) = Self::package_name_from_doc(&doc) else {
-                    return Err(anyhow!(
-                        "cannot determine [package].name for workspace publish"
-                    ));
-                };
-                super::run(root, "cargo", &["publish", "-p", &name])
+                if let Some(name) = Self::package_name_from_doc(&doc) {
+                    super::run(root, "cargo", &["publish", "-p", &name])
+                } else {
+                    Self::publish_each_member(root, &Self::workspace_members(&doc))
+                }
             }
             Layout::Package => super::run(root, "cargo", &["publish"]),
-            Layout::VirtualOrMembers { members } => {
-                for rel in Self::member_manifests(root, &members)? {
-                    let member_doc = Self::read_member_doc(&root.join(&rel))?;
-                    let Some(name) = Self::package_name_from_doc(&member_doc) else {
-                        eprintln!(
-                            "warning: skipping publish of {} (no [package].name)",
-                            rel.display()
-                        );
-                        continue;
-                    };
-                    super::run(root, "cargo", &["publish", "-p", &name])?;
-                }
-                Ok(())
-            }
+            Layout::VirtualOrMembers { members } => Self::publish_each_member(root, &members),
         }
     }
 
@@ -275,31 +307,14 @@ impl Backend for Cargo {
         let doc = Self::read_doc(root)?;
         match Self::classify(&doc) {
             Layout::WorkspacePackage => {
-                let name = Self::package_name_from_doc(&doc).ok_or_else(|| {
-                    anyhow!("cannot determine [package].name for workspace publish")
-                })?;
-                Ok(Some(format!("cargo publish -p {name}")))
+                if let Some(name) = Self::package_name_from_doc(&doc) {
+                    Ok(Some(format!("cargo publish -p {name}")))
+                } else {
+                    Self::member_publish_preview(root, &Self::workspace_members(&doc))
+                }
             }
             Layout::Package => Ok(Some("cargo publish".into())),
-            Layout::VirtualOrMembers { members } => {
-                let mut names: Vec<String> = Vec::new();
-                for rel in Self::member_manifests(root, &members)? {
-                    let member_doc = Self::read_member_doc(&root.join(&rel))?;
-                    if let Some(n) = Self::package_name_from_doc(&member_doc) {
-                        names.push(n);
-                    }
-                }
-                if names.is_empty() {
-                    Ok(Some("cargo publish".into()))
-                } else {
-                    let joined = names
-                        .iter()
-                        .map(|n| format!("cargo publish -p {n}"))
-                        .collect::<Vec<_>>()
-                        .join(" && ");
-                    Ok(Some(joined))
-                }
-            }
+            Layout::VirtualOrMembers { members } => Self::member_publish_preview(root, &members),
         }
     }
 }

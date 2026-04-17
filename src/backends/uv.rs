@@ -109,13 +109,23 @@ impl Backend for Uv {
     fn files_to_stage(&self, root: &Path) -> Vec<PathBuf> {
         let mut v = vec![PathBuf::from("pyproject.toml")];
 
-        if let Ok(doc) = Self::read_doc(root) {
-            let members = Self::workspace_members(&doc);
-            if !members.is_empty()
-                && let Ok(children) = Self::member_manifests(root, &members)
-            {
-                v.extend(children);
+        match Self::read_doc(root) {
+            Ok(doc) => {
+                let members = Self::workspace_members(&doc);
+                if !members.is_empty() {
+                    match Self::member_manifests(root, &members) {
+                        Ok(children) => v.extend(children),
+                        Err(e) => eprintln!(
+                            "warning: failed to expand uv workspace members at {}: {e}",
+                            root.display()
+                        ),
+                    }
+                }
             }
+            Err(e) => eprintln!(
+                "warning: failed to read pyproject.toml at {}: {e}",
+                root.display()
+            ),
         }
 
         if root.join("uv.lock").is_file() {
