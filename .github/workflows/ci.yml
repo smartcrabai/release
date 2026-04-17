@@ -11,8 +11,33 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
+      - name: Install taplo
+        run: |
+          if ! command -v taplo &> /dev/null; then
+            curl -fsSL https://github.com/tamasfe/taplo/releases/latest/download/taplo-linux-x86_64.gz \
+              | gzip -d - | install -m 755 /dev/stdin /usr/local/bin/taplo
+          fi
+
+      - name: Lint Cargo.toml
+        run: taplo lint Cargo.toml
+
+      - name: Check Cargo.toml formatting
+        run: taplo fmt --check --option reorder_keys=true Cargo.toml
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Run cargo check
+        run: cargo check --all-features
+
       - name: Run tests
-        uses: takumi3488/mygha/rust/test@main
+        run: cargo test --all-features
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
   automerge:
     runs-on: ubuntu-latest
