@@ -36,8 +36,13 @@ pub fn run() -> Result<()> {
 ///
 /// Returns an error when the release flow fails (parse, IO, git, subprocess).
 pub fn run_with(cli: &Cli, root: &Path) -> Result<()> {
-    let bump = cli.bump.into();
     let backend = select_backend(cli.backend, root)?;
+
+    if cli.only_publish {
+        return run_publish(backend.as_ref(), root, cli.dry_run);
+    }
+
+    let bump = cli.bump.into();
 
     // Pre-flight git validations. In dry-run we warn instead of failing.
     validate_git_state(root, cli.dry_run)?;
@@ -112,7 +117,15 @@ pub fn run_with(cli: &Cli, root: &Path) -> Result<()> {
 
     if cli.no_publish {
         println!("Skipping publish (--no-publish specified).");
-    } else if cli.dry_run {
+    } else {
+        run_publish(backend.as_ref(), root, cli.dry_run)?;
+    }
+
+    Ok(())
+}
+
+fn run_publish(backend: &dyn Backend, root: &Path, dry_run: bool) -> Result<()> {
+    if dry_run {
         if let Some(cmd) = backend.publish_command_preview(root)? {
             println!("would run: {cmd}");
         } else {
@@ -123,7 +136,6 @@ pub fn run_with(cli: &Cli, root: &Path) -> Result<()> {
             .publish(root)
             .with_context(|| format!("publish with backend '{}'", backend.name()))?;
     }
-
     Ok(())
 }
 

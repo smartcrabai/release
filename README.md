@@ -34,7 +34,7 @@ Download the archive for your platform from the [GitHub Releases](https://github
 ## Usage
 
 ```sh
-release [patch|minor|major] [-P|--no-publish] [--dry-run] [--backend <name>]
+release [patch|minor|major] [-P|--no-publish] [-p|--only-publish] [--dry-run] [--backend <name>]
 ```
 
 The positional argument defaults to `patch`.
@@ -44,6 +44,7 @@ The positional argument defaults to `patch`.
 | Flag            | Description                                                                |
 | --------------- | -------------------------------------------------------------------------- |
 | `-P`, `--no-publish` | Skip the publish step (existing `cargo-release` compatibility).       |
+| `-p`, `--only-publish` | Only run the publish step; skip bump/commit/tag/push (mutually exclusive with `--no-publish`). |
 | `--dry-run`     | Print the steps that would run without writing files or running commands. |
 | `--backend <n>` | Override auto-detection. One of `cargo`, `pnpm`, `bun`, `go`, `dotnet`, `julia`, `uv`. |
 
