@@ -4,7 +4,7 @@ edition = "2024"
 license = "MIT"
 name = "release"
 repository = "https://github.com/smartcrabai/release"
-version = "0.1.1"
+version = "0.1.2"
 
 [workspace.metadata.dist]
 cargo-dist-version = "0.31.0"
