@@ -1,13 +1,12 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 
 use crate::backend::Backend;
 use crate::backends::pnpm::{
-    files_to_stage_package_jsons, read_version_with_workspace_fallback,
-    write_package_json_version_if_present,
+    files_to_stage_package_jsons, is_package_json_publishable, parse_package_json,
+    read_version_with_workspace_fallback, write_package_json_version_if_present,
 };
 use crate::backends::workspace::child_package_jsons;
 
@@ -37,15 +36,31 @@ fn bun_child_package_jsons(root: &Path) -> Result<Vec<PathBuf>> {
     if !pkg_path.is_file() {
         return Ok(Vec::new());
     }
-    let text =
-        fs::read_to_string(&pkg_path).with_context(|| format!("read {}", pkg_path.display()))?;
-    let json: Value =
-        serde_json::from_str(&text).with_context(|| format!("parse {}", pkg_path.display()))?;
-    let patterns = extract_workspace_patterns(&json);
+    let patterns = extract_workspace_patterns(&parse_package_json(&pkg_path)?);
     if patterns.is_empty() {
         return Ok(Vec::new());
     }
     child_package_jsons(root, &patterns)
+}
+
+const NO_PUBLISHABLE_PACKAGES: &str =
+    "no publishable packages: every package.json is private or missing a version";
+
+/// Directories (relative to `root`) where `bun publish` should run. An empty
+/// `PathBuf` represents `root` itself.
+fn publish_dirs(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let root_pkg = root.join("package.json");
+    if root_pkg.is_file() && is_package_json_publishable(&root_pkg)? {
+        dirs.push(PathBuf::new());
+    }
+    for rel in bun_child_package_jsons(root)? {
+        if is_package_json_publishable(&root.join(&rel))? {
+            let parent = rel.parent().map(Path::to_path_buf).unwrap_or_default();
+            dirs.push(parent);
+        }
+    }
+    Ok(dirs)
 }
 
 impl Backend for Bun {
@@ -86,16 +101,46 @@ impl Backend for Bun {
     }
 
     fn publish(&self, root: &Path) -> Result<()> {
-        super::run(root, "bun", &["publish"])
+        let dirs = publish_dirs(root)?;
+        if dirs.is_empty() {
+            return Err(anyhow!(
+                "{NO_PUBLISHABLE_PACKAGES} (under {})",
+                root.display()
+            ));
+        }
+        for d in dirs {
+            super::run(&root.join(&d), "bun", &["publish"])?;
+        }
+        Ok(())
     }
 
-    fn publish_command_preview(&self, _root: &Path) -> Result<Option<String>> {
-        Ok(Some("bun publish".into()))
+    fn publish_command_preview(&self, root: &Path) -> Result<Option<String>> {
+        let dirs = publish_dirs(root)?;
+        if dirs.is_empty() {
+            return Ok(Some(format!("({NO_PUBLISHABLE_PACKAGES})")));
+        }
+        if dirs.len() == 1 && dirs[0].as_os_str().is_empty() {
+            return Ok(Some("bun publish".into()));
+        }
+        let parts: Vec<String> = dirs
+            .iter()
+            .map(|d| {
+                let shown = if d.as_os_str().is_empty() {
+                    ".".into()
+                } else {
+                    d.display().to_string()
+                };
+                format!("(cd {shown} && bun publish)")
+            })
+            .collect();
+        Ok(Some(parts.join(" && ")))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use anyhow::Result;
 
     use super::*;
@@ -214,6 +259,156 @@ mod tests {
         let staged = backend.files_to_stage(root);
         assert!(!staged.contains(&PathBuf::from("package.json")));
         assert!(staged.contains(&PathBuf::from("packages/a/package.json")));
+        Ok(())
+    }
+
+    #[test]
+    fn publish_preview_single_package() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        fs::write(
+            tmp.path().join("package.json"),
+            "{ \"name\": \"solo\", \"version\": \"1.0.0\" }\n",
+        )?;
+        let backend = Bun;
+        assert_eq!(
+            backend.publish_command_preview(tmp.path())?,
+            Some("bun publish".into())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn publish_preview_workspace_skips_private_root() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        fs::write(
+            root.join("package.json"),
+            "{ \"name\": \"root\", \"private\": true, \"workspaces\": [\"packages/*\"] }\n",
+        )?;
+        fs::create_dir_all(root.join("packages/a"))?;
+        fs::create_dir_all(root.join("packages/b"))?;
+        fs::write(
+            root.join("packages/a/package.json"),
+            "{ \"name\": \"@x/a\", \"version\": \"0.1.0\" }\n",
+        )?;
+        fs::write(
+            root.join("packages/b/package.json"),
+            "{ \"name\": \"@x/b\", \"version\": \"0.1.0\" }\n",
+        )?;
+
+        let backend = Bun;
+        let preview = backend.publish_command_preview(root)?.unwrap_or_default();
+        assert!(
+            preview.contains("(cd packages/a && bun publish)"),
+            "{preview}"
+        );
+        assert!(
+            preview.contains("(cd packages/b && bun publish)"),
+            "{preview}"
+        );
+        assert!(!preview.contains("(cd . &&"), "{preview}");
+        Ok(())
+    }
+
+    #[test]
+    fn publish_preview_workspace_includes_publishable_root() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        fs::write(
+            root.join("package.json"),
+            "{ \"name\": \"root\", \"version\": \"1.0.0\", \"workspaces\": [\"packages/*\"] }\n",
+        )?;
+        fs::create_dir_all(root.join("packages/a"))?;
+        fs::write(
+            root.join("packages/a/package.json"),
+            "{ \"name\": \"@x/a\", \"version\": \"1.0.0\" }\n",
+        )?;
+
+        let backend = Bun;
+        let preview = backend.publish_command_preview(root)?.unwrap_or_default();
+        assert!(preview.contains("(cd . && bun publish)"), "{preview}");
+        assert!(
+            preview.contains("(cd packages/a && bun publish)"),
+            "{preview}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn publish_preview_workspace_skips_private_child() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        fs::write(
+            root.join("package.json"),
+            "{ \"name\": \"root\", \"private\": true, \"workspaces\": [\"packages/*\"] }\n",
+        )?;
+        fs::create_dir_all(root.join("packages/pub"))?;
+        fs::create_dir_all(root.join("packages/priv"))?;
+        fs::write(
+            root.join("packages/pub/package.json"),
+            "{ \"name\": \"@x/pub\", \"version\": \"0.1.0\" }\n",
+        )?;
+        fs::write(
+            root.join("packages/priv/package.json"),
+            "{ \"name\": \"@x/priv\", \"version\": \"0.1.0\", \"private\": true }\n",
+        )?;
+
+        let backend = Bun;
+        let preview = backend.publish_command_preview(root)?.unwrap_or_default();
+        assert!(
+            preview.contains("(cd packages/pub && bun publish)"),
+            "{preview}"
+        );
+        assert!(!preview.contains("packages/priv"), "{preview}");
+        Ok(())
+    }
+
+    #[test]
+    fn publish_preview_single_private_package_errors() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        fs::write(
+            tmp.path().join("package.json"),
+            "{ \"name\": \"solo\", \"version\": \"1.0.0\", \"private\": true }\n",
+        )?;
+        let backend = Bun;
+        let preview = backend
+            .publish_command_preview(tmp.path())?
+            .unwrap_or_default();
+        assert!(preview.contains("no publishable packages"), "{preview}");
+        match backend.publish(tmp.path()) {
+            Err(e) => assert!(
+                format!("{e}").contains("no publishable packages"),
+                "got {e}"
+            ),
+            Ok(()) => panic!("expected publish to error for private root package"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn publish_preview_workspace_no_publishable_packages() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        fs::write(
+            root.join("package.json"),
+            "{ \"name\": \"root\", \"private\": true, \"workspaces\": [\"packages/*\"] }\n",
+        )?;
+        fs::create_dir_all(root.join("packages/a"))?;
+        fs::write(
+            root.join("packages/a/package.json"),
+            "{ \"name\": \"@x/a\", \"version\": \"0.1.0\", \"private\": true }\n",
+        )?;
+
+        let backend = Bun;
+        let preview = backend.publish_command_preview(root)?.unwrap_or_default();
+        assert!(preview.contains("no publishable packages"), "{preview}");
+        match backend.publish(root) {
+            Err(e) => assert!(
+                format!("{e}").contains("no publishable packages"),
+                "got {e}"
+            ),
+            Ok(()) => panic!("expected publish to error when no packages are publishable"),
+        }
         Ok(())
     }
 

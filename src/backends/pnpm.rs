@@ -9,6 +9,16 @@ use crate::backends::workspace::child_package_jsons;
 
 pub struct Pnpm;
 
+/// Read and parse a `package.json` file as a `serde_json::Value`.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read or parsed.
+pub(crate) fn parse_package_json(path: &Path) -> Result<Value> {
+    let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))
+}
+
 /// Read a version from a `package.json` file, or `None` if no string
 /// `"version"` field is present.
 ///
@@ -16,10 +26,7 @@ pub struct Pnpm;
 ///
 /// Returns an error when the file cannot be read or parsed.
 pub fn read_package_json_version_opt(path: &Path) -> Result<Option<String>> {
-    let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let json: Value =
-        serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
-    Ok(json
+    Ok(parse_package_json(path)?
         .get("version")
         .and_then(Value::as_str)
         .map(str::to_owned))
@@ -77,6 +84,25 @@ pub fn write_package_json_version_if_present(path: &Path, new: &str) -> Result<b
 
     fs::write(path, replaced).with_context(|| format!("write {}", path.display()))?;
     Ok(true)
+}
+
+/// Returns `true` if the `package.json` at `path` is a candidate for `npm
+/// publish`-style publishing: it must have a string `"version"` field and
+/// must not have `"private": true`. Workspace roots (typically private and
+/// version-less) and packages explicitly opted out via `"private": true`
+/// both return `false`.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read or parsed.
+pub fn is_package_json_publishable(path: &Path) -> Result<bool> {
+    let json = parse_package_json(path)?;
+    let has_version = json.get("version").and_then(Value::as_str).is_some();
+    let is_private = json
+        .get("private")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Ok(has_version && !is_private)
 }
 
 /// Read the version from `<root>/package.json`, falling back to the first
@@ -197,6 +223,17 @@ fn strip_yaml_quotes(s: &str) -> &str {
     s
 }
 
+/// `pnpm publish` arguments, switching to recursive (`-r`) when any workspace
+/// children are present. `pnpm -r publish` skips `"private": true` packages
+/// itself, so we don't need to filter manually.
+fn pnpm_publish_args(root: &Path) -> Result<&'static [&'static str]> {
+    if pnpm_child_package_jsons(root)?.is_empty() {
+        Ok(&["publish", "--no-git-checks"])
+    } else {
+        Ok(&["-r", "publish", "--no-git-checks"])
+    }
+}
+
 /// Read `pnpm-workspace.yaml` if present and return the resolved child
 /// `package.json` paths (relative to `root`).
 fn pnpm_child_package_jsons(root: &Path) -> Result<Vec<PathBuf>> {
@@ -245,11 +282,11 @@ impl Backend for Pnpm {
     }
 
     fn publish(&self, root: &Path) -> Result<()> {
-        super::run(root, "pnpm", &["publish", "--no-git-checks"])
+        super::run(root, "pnpm", pnpm_publish_args(root)?)
     }
 
-    fn publish_command_preview(&self, _root: &Path) -> Result<Option<String>> {
-        Ok(Some("pnpm publish --no-git-checks".into()))
+    fn publish_command_preview(&self, root: &Path) -> Result<Option<String>> {
+        Ok(Some(format!("pnpm {}", pnpm_publish_args(root)?.join(" "))))
     }
 }
 
@@ -394,6 +431,47 @@ mod tests {
         assert!(!staged.contains(&PathBuf::from("package.json")));
         assert!(staged.contains(&PathBuf::from("packages/a/package.json")));
         assert!(staged.contains(&PathBuf::from("packages/b/package.json")));
+        Ok(())
+    }
+
+    #[test]
+    fn publish_preview_single_package() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        fs::write(
+            tmp.path().join("package.json"),
+            "{ \"name\": \"solo\", \"version\": \"1.0.0\" }\n",
+        )?;
+        let backend = Pnpm;
+        assert_eq!(
+            backend.publish_command_preview(tmp.path())?,
+            Some("pnpm publish --no-git-checks".into())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn publish_preview_workspace_uses_recursive_flag() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        fs::write(
+            root.join("package.json"),
+            "{ \"name\": \"root\", \"private\": true }\n",
+        )?;
+        fs::write(
+            root.join("pnpm-workspace.yaml"),
+            "packages:\n  - \"packages/*\"\n",
+        )?;
+        fs::create_dir_all(root.join("packages/a"))?;
+        fs::write(
+            root.join("packages/a/package.json"),
+            "{ \"name\": \"@x/a\", \"version\": \"0.1.0\" }\n",
+        )?;
+
+        let backend = Pnpm;
+        assert_eq!(
+            backend.publish_command_preview(root)?,
+            Some("pnpm -r publish --no-git-checks".into())
+        );
         Ok(())
     }
 }
