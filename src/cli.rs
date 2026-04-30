@@ -31,6 +31,10 @@ pub struct Cli {
     #[arg(short = 'P', long)]
     pub no_publish: bool,
 
+    /// Only run the publish step; skip version bump, commit, tag and push.
+    #[arg(short = 'p', long, conflicts_with = "no_publish")]
+    pub only_publish: bool,
+
     /// Print the actions that would be performed without making any changes.
     #[arg(long)]
     pub dry_run: bool,
