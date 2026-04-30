@@ -282,6 +282,7 @@ impl Backend for Pnpm {
     }
 
     fn publish(&self, root: &Path) -> Result<()> {
+        super::ensure_npm_login(root, "pnpm", &["whoami"])?;
         super::run(root, "pnpm", pnpm_publish_args(root)?)
     }
 

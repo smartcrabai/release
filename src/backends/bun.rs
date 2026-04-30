@@ -108,6 +108,7 @@ impl Backend for Bun {
                 root.display()
             ));
         }
+        super::ensure_npm_login(root, "bun", &["pm", "whoami"])?;
         for d in dirs {
             super::run(&root.join(&d), "bun", &["publish"])?;
         }

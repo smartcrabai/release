@@ -10,7 +10,7 @@ pub mod uv;
 pub mod workspace;
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, anyhow};
 
@@ -42,4 +42,28 @@ pub(crate) fn run(root: &Path, program: &str, args: &[&str]) -> Result<()> {
         return Err(anyhow!("{program} {} failed", args.join(" ")));
     }
     Ok(())
+}
+
+/// Ensure the user is logged in to the npm registry before publishing.
+///
+/// Authentication is registry-global, so callers should invoke this once per
+/// publish operation rather than per-package. The login fallback is hardcoded
+/// to `npm login` because bun and pnpm both read credentials from `.npmrc`.
+pub(crate) fn ensure_npm_login(
+    root: &Path,
+    whoami_program: &str,
+    whoami_args: &[&str],
+) -> Result<()> {
+    let status = Command::new(whoami_program)
+        .current_dir(root)
+        .args(whoami_args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .with_context(|| format!("run {whoami_program} {}", whoami_args.join(" ")))?;
+    if status.success() {
+        return Ok(());
+    }
+    eprintln!("not logged in to npm registry; running `npm login`");
+    run(root, "npm", &["login"])
 }
