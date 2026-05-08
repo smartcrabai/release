@@ -26,7 +26,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 glob = "0.3"
 serde_json = "1"
-toml_edit = "0.22"
+toml_edit = "0.25"
 
 [dev-dependencies]
 tempfile = "3"
