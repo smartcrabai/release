@@ -20,6 +20,8 @@ targets = [
   "x86_64-pc-windows-msvc",
   "aarch64-pc-windows-msvc",
 ]
+# Allow manually edited GitHub Actions workflow to use newer artifact actions
+allow-dirty = ["ci"]
 
 [dependencies]
 anyhow = "1"
