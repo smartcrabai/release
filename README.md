@@ -78,6 +78,11 @@ manifest. Glob patterns use single-segment wildcards (`packages/*`,
 | go      | — (no version files; the git tag is the release)             | — (not applicable)                                                  |
 | julia   | — (no standard workspace layout)                             | — (not applicable)                                                  |
 
+For `bun`, publishable workspace packages are published in dependency order
+(each package's intra-workspace dependencies are published before it). Cycles
+in the dependency graph abort the publish step. `pnpm` delegates ordering to
+`pnpm -r publish`, which already publishes in topological order.
+
 ## Git workflow
 
 For every backend the tool:

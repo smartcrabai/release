@@ -86,23 +86,26 @@ pub fn write_package_json_version_if_present(path: &Path, new: &str) -> Result<b
     Ok(true)
 }
 
-/// Returns `true` if the `package.json` at `path` is a candidate for `npm
+/// Returns `true` if a parsed `package.json` is a candidate for `npm
 /// publish`-style publishing: it must have a string `"version"` field and
-/// must not have `"private": true`. Workspace roots (typically private and
-/// version-less) and packages explicitly opted out via `"private": true`
-/// both return `false`.
-///
-/// # Errors
-///
-/// Returns an error when the file cannot be read or parsed.
-pub fn is_package_json_publishable(path: &Path) -> Result<bool> {
-    let json = parse_package_json(path)?;
+/// must not have `"private": true`.
+pub fn is_publishable_json(json: &Value) -> bool {
     let has_version = json.get("version").and_then(Value::as_str).is_some();
     let is_private = json
         .get("private")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    Ok(has_version && !is_private)
+    has_version && !is_private
+}
+
+/// Returns `true` if the `package.json` at `path` is a candidate for `npm
+/// publish`-style publishing. See [`is_publishable_json`].
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read or parsed.
+pub fn is_package_json_publishable(path: &Path) -> Result<bool> {
+    Ok(is_publishable_json(&parse_package_json(path)?))
 }
 
 /// Read the version from `<root>/package.json`, falling back to the first
