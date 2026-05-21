@@ -217,8 +217,7 @@ fn sync_bun_lockfile_workspace_versions(root: &Path) -> Result<()> {
         content = replace_workspace_version_in_lockfile(&content, &parent_str, &version)?;
     }
 
-    std::fs::write(&lockfile, content)
-        .with_context(|| format!("write {}", lockfile.display()))?;
+    std::fs::write(&lockfile, content).with_context(|| format!("write {}", lockfile.display()))?;
     Ok(())
 }
 
@@ -984,7 +983,11 @@ mod tests {
 
         let after = fs::read_to_string(root.join("bun.lock"))?;
         // All three workspace entries should now reflect 0.2.0.
-        assert_eq!(after.matches("\"version\": \"0.2.0\"").count(), 3, "{after}");
+        assert_eq!(
+            after.matches("\"version\": \"0.2.0\"").count(),
+            3,
+            "{after}"
+        );
         assert!(!after.contains("\"version\": \"0.1.0\""), "{after}");
         Ok(())
     }
