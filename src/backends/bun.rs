@@ -180,6 +180,141 @@ fn publish_dirs(root: &Path) -> Result<Vec<PathBuf>> {
     topo_sort_dirs(collect_publishable_packages(root)?)
 }
 
+/// Update every `workspaces.<path>.version` entry in `bun.lock` to match the
+/// `version` field of the matching on-disk `package.json`. Touches only the
+/// workspace section; external package resolutions are left alone.
+fn sync_bun_lockfile_workspace_versions(root: &Path) -> Result<()> {
+    let lockfile = root.join("bun.lock");
+    if !lockfile.is_file() {
+        return Ok(());
+    }
+    let mut content = std::fs::read_to_string(&lockfile)
+        .with_context(|| format!("read {}", lockfile.display()))?;
+
+    let root_pkg = root.join("package.json");
+    if root_pkg.is_file()
+        && let Some(v) = parse_package_json(&root_pkg)?
+            .get("version")
+            .and_then(Value::as_str)
+    {
+        content = replace_workspace_version_in_lockfile(&content, "", v)?;
+    }
+
+    for rel in bun_child_package_jsons(root)? {
+        let parent = rel.parent().unwrap_or(Path::new(""));
+        let parent_str = parent.to_string_lossy().replace('\\', "/");
+        if parent_str.is_empty() {
+            continue;
+        }
+        let pkg_path = root.join(&rel);
+        let Some(version) = parse_package_json(&pkg_path)?
+            .get("version")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        content = replace_workspace_version_in_lockfile(&content, &parent_str, &version)?;
+    }
+
+    std::fs::write(&lockfile, content)
+        .with_context(|| format!("write {}", lockfile.display()))?;
+    Ok(())
+}
+
+/// Replace the `"version"` field inside the `"workspaces"."<key>"` object of a
+/// `bun.lock` document. Returns the input unchanged when the key is absent or
+/// when the block has no `"version"` field. Errors only on malformed lockfile
+/// structure (unbalanced braces, unterminated string).
+fn replace_workspace_version_in_lockfile(
+    content: &str,
+    workspace_key: &str,
+    new_version: &str,
+) -> Result<String> {
+    let ws_anchor = "\"workspaces\":";
+    let Some(ws_idx) = content.find(ws_anchor) else {
+        return Ok(content.to_owned());
+    };
+    let after_ws = &content[ws_idx + ws_anchor.len()..];
+    let Some(ws_open_rel) = after_ws.find('{') else {
+        return Ok(content.to_owned());
+    };
+    let ws_open_abs = ws_idx + ws_anchor.len() + ws_open_rel;
+    let ws_close_abs = match_brace(content, ws_open_abs)?;
+
+    let key_pattern = format!("\"{workspace_key}\":");
+    let ws_section = &content[ws_open_abs..=ws_close_abs];
+    let Some(key_rel) = ws_section.find(&key_pattern) else {
+        return Ok(content.to_owned());
+    };
+    let key_abs = ws_open_abs + key_rel;
+
+    let after_key = &content[key_abs + key_pattern.len()..];
+    let Some(block_open_rel) = after_key.find('{') else {
+        return Ok(content.to_owned());
+    };
+    let block_open_abs = key_abs + key_pattern.len() + block_open_rel;
+    let block_close_abs = match_brace(content, block_open_abs)?;
+
+    let block = &content[block_open_abs..=block_close_abs];
+    let version_key = "\"version\":";
+    let Some(version_rel) = block.find(version_key) else {
+        return Ok(content.to_owned());
+    };
+    let after_version = &content[block_open_abs + version_rel + version_key.len()..];
+    let Some(quote_rel) = after_version.find('"') else {
+        return Err(anyhow!("malformed bun.lock: version value not quoted"));
+    };
+    let value_start = block_open_abs + version_rel + version_key.len() + quote_rel + 1;
+    let Some(end_quote_rel) = content[value_start..].find('"') else {
+        return Err(anyhow!("malformed bun.lock: unterminated version string"));
+    };
+    let value_end = value_start + end_quote_rel;
+
+    let mut out = String::with_capacity(content.len());
+    out.push_str(&content[..value_start]);
+    out.push_str(new_version);
+    out.push_str(&content[value_end..]);
+    Ok(out)
+}
+
+/// Given the byte index of an opening `{`, return the index of its matching
+/// `}`. Tracks `"..."` strings (with `\"` escapes) so braces inside string
+/// values don't perturb the depth counter.
+fn match_brace(content: &str, open: usize) -> Result<usize> {
+    let bytes = content.as_bytes();
+    if open >= bytes.len() || bytes[open] != b'{' {
+        return Err(anyhow!("internal: match_brace called on non-`{{` byte"));
+    }
+    let mut depth: usize = 0;
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, &b) in bytes.iter().enumerate().skip(open) {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(anyhow!("malformed bun.lock: unbalanced braces"))
+}
+
 impl Backend for Bun {
     fn name(&self) -> &'static str {
         "bun"
@@ -199,6 +334,12 @@ impl Backend for Bun {
     }
 
     fn update_lockfile(&self, root: &Path) -> Result<()> {
+        // `bun install` does not re-sync workspace member `version` fields in
+        // an existing `bun.lock`. Without this, `bun publish` resolves
+        // `workspace:^`/`workspace:~` in published tarballs against stale
+        // versions baked into the lockfile, producing dependency ranges that
+        // lag the just-bumped release. Surgically patch the lockfile first.
+        sync_bun_lockfile_workspace_versions(root)?;
         super::run(root, "bun", &["install"])
     }
 
@@ -751,6 +892,100 @@ mod tests {
             .find("packages/c")
             .ok_or_else(|| anyhow!("c not in {preview}"))?;
         assert!(a < b && b < c, "expected a < b < c in {preview}");
+        Ok(())
+    }
+
+    #[test]
+    fn replace_workspace_version_updates_member_block() -> Result<()> {
+        let lock = "{\n  \"workspaces\": {\n    \"\": {\n      \"name\": \"root\"\n    },\n    \"packages/cli\": {\n      \"name\": \"@x/cli\",\n      \"version\": \"0.1.14\",\n      \"dependencies\": {\n        \"@x/sdk\": \"workspace:^\"\n      }\n    },\n    \"packages/sdk\": {\n      \"name\": \"@x/sdk\",\n      \"version\": \"0.1.14\"\n    }\n  }\n}\n";
+        let updated = replace_workspace_version_in_lockfile(lock, "packages/cli", "0.1.18")?;
+        assert!(updated.contains("\"packages/cli\""), "{updated}");
+        let cli_block_start = updated
+            .find("\"packages/cli\"")
+            .ok_or_else(|| anyhow!("missing cli key"))?;
+        let cli_block_end = updated[cli_block_start..]
+            .find("\"packages/sdk\"")
+            .map(|x| cli_block_start + x)
+            .ok_or_else(|| anyhow!("missing sdk key"))?;
+        let cli_block = &updated[cli_block_start..cli_block_end];
+        assert!(
+            cli_block.contains("\"version\": \"0.1.18\""),
+            "cli block did not get bumped: {cli_block}"
+        );
+        // sdk block must be untouched
+        let sdk_block = &updated[cli_block_end..];
+        assert!(
+            sdk_block.contains("\"version\": \"0.1.14\""),
+            "sdk block was modified: {sdk_block}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replace_workspace_version_handles_root_key() -> Result<()> {
+        let lock = "{\n  \"workspaces\": {\n    \"\": {\n      \"name\": \"root\",\n      \"version\": \"0.1.14\"\n    }\n  }\n}\n";
+        let updated = replace_workspace_version_in_lockfile(lock, "", "0.2.0")?;
+        assert!(updated.contains("\"version\": \"0.2.0\""), "{updated}");
+        Ok(())
+    }
+
+    #[test]
+    fn replace_workspace_version_is_noop_when_key_missing() -> Result<()> {
+        let lock = "{\n  \"workspaces\": {\n    \"packages/a\": { \"name\": \"@x/a\", \"version\": \"1.0.0\" }\n  }\n}\n";
+        let updated = replace_workspace_version_in_lockfile(lock, "packages/b", "9.9.9")?;
+        assert_eq!(updated, lock);
+        Ok(())
+    }
+
+    #[test]
+    fn replace_workspace_version_is_noop_when_block_has_no_version() -> Result<()> {
+        let lock =
+            "{\n  \"workspaces\": {\n    \"\": { \"name\": \"root\", \"private\": true }\n  }\n}\n";
+        let updated = replace_workspace_version_in_lockfile(lock, "", "9.9.9")?;
+        assert_eq!(updated, lock);
+        Ok(())
+    }
+
+    #[test]
+    fn match_brace_skips_braces_inside_strings() -> Result<()> {
+        let s = r#"{ "k": "value with } brace", "n": 1 }"#;
+        let close = match_brace(s, 0)?;
+        assert_eq!(&s[close..=close], "}");
+        assert_eq!(close, s.len() - 1);
+        Ok(())
+    }
+
+    #[test]
+    fn sync_bun_lockfile_workspace_versions_updates_members() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        fs::write(
+            root.join("package.json"),
+            "{\n  \"name\": \"root\",\n  \"version\": \"0.2.0\",\n  \"private\": true,\n  \"workspaces\": [\"packages/*\"]\n}\n",
+        )?;
+        fs::create_dir_all(root.join("packages/cli"))?;
+        fs::create_dir_all(root.join("packages/sdk"))?;
+        fs::write(
+            root.join("packages/cli/package.json"),
+            "{ \"name\": \"@x/cli\", \"version\": \"0.2.0\", \"dependencies\": { \"@x/sdk\": \"workspace:^\" } }\n",
+        )?;
+        fs::write(
+            root.join("packages/sdk/package.json"),
+            "{ \"name\": \"@x/sdk\", \"version\": \"0.2.0\" }\n",
+        )?;
+        // Lockfile carries the *previous* versions (0.1.0) — what we get from a
+        // stale `bun install`.
+        fs::write(
+            root.join("bun.lock"),
+            "{\n  \"workspaces\": {\n    \"\": { \"name\": \"root\", \"version\": \"0.1.0\" },\n    \"packages/cli\": { \"name\": \"@x/cli\", \"version\": \"0.1.0\", \"dependencies\": { \"@x/sdk\": \"workspace:^\" } },\n    \"packages/sdk\": { \"name\": \"@x/sdk\", \"version\": \"0.1.0\" }\n  }\n}\n",
+        )?;
+
+        sync_bun_lockfile_workspace_versions(root)?;
+
+        let after = fs::read_to_string(root.join("bun.lock"))?;
+        // All three workspace entries should now reflect 0.2.0.
+        assert_eq!(after.matches("\"version\": \"0.2.0\"").count(), 3, "{after}");
+        assert!(!after.contains("\"version\": \"0.1.0\""), "{after}");
         Ok(())
     }
 
