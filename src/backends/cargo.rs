@@ -139,10 +139,7 @@ fn topo_sort_members(pkgs: Vec<(PathBuf, MemberPkg)>) -> Result<Vec<(PathBuf, Me
 
     // `order` is a permutation of 0..n, so each entry is taken exactly once.
     let mut slots: Vec<Option<(PathBuf, MemberPkg)>> = pkgs.into_iter().map(Some).collect();
-    Ok(order
-        .into_iter()
-        .filter_map(|i| slots[i].take())
-        .collect())
+    Ok(order.into_iter().filter_map(|i| slots[i].take()).collect())
 }
 
 impl Cargo {
@@ -687,10 +684,7 @@ mod tests {
             Ok(_) => panic!("expected cycle error"),
         };
         assert!(err.contains("cycle"), "{err}");
-        let affected = err
-            .rsplit("affected members: ")
-            .next()
-            .unwrap_or_default();
+        let affected = err.rsplit("affected members: ").next().unwrap_or_default();
         assert!(affected.contains('a'), "{err}");
         assert!(affected.contains('b'), "{err}");
         match backend.publish(root) {
