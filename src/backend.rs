@@ -56,4 +56,14 @@ pub trait Backend {
     /// Returns an error when reading the manifest (needed for e.g. workspace
     /// package selection) fails.
     fn publish_command_preview(&self, root: &Path) -> Result<Option<String>>;
+
+    /// Additional manifest files (beyond the root) that `write_version` would
+    /// write for `--dry-run` logging. Relative to `root`. Default: empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the manifest cannot be read.
+    fn additional_write_previews(&self, _root: &Path, _new: &str) -> Result<Vec<PathBuf>> {
+        Ok(vec![])
+    }
 }

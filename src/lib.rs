@@ -65,6 +65,17 @@ pub fn run_with(cli: &Cli, root: &Path) -> Result<()> {
 
     if cli.dry_run {
         println!("would write: manifest version -> {new}");
+        for path in backend
+            .additional_write_previews(root, &new)
+            .with_context(|| {
+                format!(
+                    "preview additional writes with backend '{}'",
+                    backend.name()
+                )
+            })?
+        {
+            println!("would write: {}", path.display());
+        }
     } else {
         backend
             .write_version(root, &new)
