@@ -13,6 +13,10 @@ pub struct Cargo;
 /// Dependency-table keys whose entries can reference another workspace member.
 const DEP_KEYS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
 
+/// Arguments passed to `cargo` by `update_lockfile`.  Shared with
+/// `lockfile_command_preview` so the two never drift apart.
+const LOCKFILE_ARGS: &[&str] = &["update", "--workspace"];
+
 /// A publishable workspace member, used to order publishes so that each
 /// member's intra-workspace dependencies are published before it.
 struct MemberPkg {
@@ -528,11 +532,11 @@ impl Backend for Cargo {
     }
 
     fn update_lockfile(&self, root: &Path) -> Result<()> {
-        super::run(root, "cargo", &["generate-lockfile"])
+        super::run(root, "cargo", LOCKFILE_ARGS)
     }
 
     fn lockfile_command_preview(&self) -> Option<String> {
-        Some("cargo generate-lockfile".into())
+        Some(format!("cargo {}", LOCKFILE_ARGS.join(" ")))
     }
 
     fn files_to_stage(&self, root: &Path) -> Vec<PathBuf> {
@@ -1249,5 +1253,13 @@ mod tests {
             "workspace.dependencies.a version not updated: {root_after}"
         );
         Ok(())
+    }
+
+    // --- update_lockfile / lockfile_command_preview ---
+
+    #[test]
+    fn lockfile_command_preview_returns_update_workspace() {
+        let preview = Cargo.lockfile_command_preview();
+        assert_eq!(preview, Some("cargo update --workspace".into()));
     }
 }
