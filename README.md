@@ -52,7 +52,7 @@ The positional argument defaults to `patch`.
 
 | Backend | Detection (first match wins)                          | Version location                                | Lockfile update              | Publish                                       |
 | ------- | ----------------------------------------------------- | ----------------------------------------------- | ---------------------------- | --------------------------------------------- |
-| cargo   | `Cargo.toml`                                          | `[package].version` / `[workspace.package].version` | `cargo generate-lockfile` | `cargo publish` (workspace: `-p <name>`)      |
+| cargo   | `Cargo.toml`                                          | `[package].version` / `[workspace.package].version` | `cargo update --workspace` (requires Cargo >= 1.66) | `cargo publish` (workspace: `-p <name>`)      |
 | uv      | `pyproject.toml` + `uv.lock`                          | `[project].version`                             | `uv lock`                    | `uv publish`                                  |
 | pnpm    | `package.json` + `pnpm-lock.yaml` (or `package.json` alone as fallback) | `"version"` in `package.json`      | `pnpm install --lockfile-only` | `pnpm publish --no-git-checks`              |
 | bun     | `package.json` + `bun.lock` or `bun.lockb`            | `"version"` in `package.json`                   | `bun install`                | `bun publish`                                 |
