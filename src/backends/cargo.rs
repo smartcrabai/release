@@ -40,6 +40,94 @@ fn collect_dep_names(table: &Table, out: &mut HashSet<String>) {
     }
 }
 
+/// Rewrite the `version` requirement of intra-workspace dependency entries in
+/// a single dependency table. Returns `true` when at least one value changed.
+fn rewrite_dep_table(table: &mut Table, members: &HashSet<String>, new: &str) -> bool {
+    // Collect keys first to avoid simultaneous borrow issues.
+    let to_update: Vec<String> = table
+        .iter()
+        .filter_map(|(key, item)| {
+            let real_name = item
+                .as_table_like()
+                .and_then(|t| t.get("package"))
+                .and_then(|i| i.as_str())
+                .unwrap_or(key);
+            if !members.contains(real_name) {
+                return None;
+            }
+            // Plain-string shorthand `a = "1.0.0"` is itself the version.
+            // Table-like forms are included only when they already carry a `version` key.
+            let has_version = item.as_str().is_some()
+                || item
+                    .as_table_like()
+                    .is_some_and(|t| t.contains_key("version"));
+            has_version.then(|| key.to_owned())
+        })
+        .collect();
+
+    let mut changed = false;
+    for key in to_update {
+        let Some(item) = table.get_mut(&key) else {
+            continue;
+        };
+        if let Some(tbl) = item.as_table_mut() {
+            tbl["version"] = toml_edit::value(new);
+            changed = true;
+        } else if let Some(toml_edit::Value::InlineTable(tbl)) = item.as_value_mut() {
+            tbl["version"] = toml_edit::Value::from(new);
+            changed = true;
+        } else if item.as_str().is_some() {
+            *item = toml_edit::value(new);
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Rewrite version requirements of intra-workspace dependencies across all
+/// dependency tables in `doc` (regular, dev, build, target-scoped, and
+/// `[workspace.dependencies]`).
+///
+/// Only entries whose real crate name is in `members` **and** that already
+/// carry a `version` key are updated; no new keys are introduced.
+/// Returns `true` when at least one value changed.
+fn rewrite_intra_workspace_dep_versions(
+    doc: &mut DocumentMut,
+    members: &HashSet<String>,
+    new: &str,
+) -> bool {
+    let mut changed = false;
+
+    for key in DEP_KEYS {
+        if let Some(table) = doc.get_mut(key).and_then(Item::as_table_mut) {
+            changed |= rewrite_dep_table(table, members, new);
+        }
+    }
+
+    if let Some(targets) = doc.get_mut("target").and_then(Item::as_table_mut) {
+        for (_, cfg) in targets.iter_mut() {
+            if let Some(cfg_table) = cfg.as_table_mut() {
+                for dep_key in DEP_KEYS {
+                    if let Some(table) = cfg_table.get_mut(dep_key).and_then(Item::as_table_mut) {
+                        changed |= rewrite_dep_table(table, members, new);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(ws_deps) = doc
+        .get_mut("workspace")
+        .and_then(Item::as_table_mut)
+        .and_then(|t| t.get_mut("dependencies"))
+        .and_then(Item::as_table_mut)
+    {
+        changed |= rewrite_dep_table(ws_deps, members, new);
+    }
+
+    changed
+}
+
 /// Gather every dependency name declared by a member manifest across the
 /// regular, dev, build and `target.*` dependency tables.
 fn member_dep_names(doc: &DocumentMut) -> HashSet<String> {
@@ -55,7 +143,7 @@ fn member_dep_names(doc: &DocumentMut) -> HashSet<String> {
             let Some(cfg_table) = cfg.as_table() else {
                 continue;
             };
-            for key in ["dependencies", "build-dependencies"] {
+            for key in DEP_KEYS {
                 if let Some(table) = cfg_table.get(key).and_then(Item::as_table) {
                     collect_dep_names(table, &mut out);
                 }
@@ -214,25 +302,6 @@ impl Cargo {
             .map(str::to_owned))
     }
 
-    fn write_package_version(manifest: &Path, new: &str) -> Result<()> {
-        let text =
-            fs::read_to_string(manifest).with_context(|| format!("read {}", manifest.display()))?;
-        let mut doc = text
-            .parse::<DocumentMut>()
-            .with_context(|| format!("parse {}", manifest.display()))?;
-        let Some(pkg) = doc.get_mut("package").and_then(Item::as_table_mut) else {
-            // Member without `[package]`? Skip silently.
-            return Ok(());
-        };
-        if !pkg.contains_key("version") {
-            return Ok(());
-        }
-        pkg["version"] = toml_edit::value(new);
-        fs::write(manifest, doc.to_string())
-            .with_context(|| format!("write {}", manifest.display()))?;
-        Ok(())
-    }
-
     /// Return member `Cargo.toml` paths (relative to `root`). Patterns can be
     /// either literal directories (`"crates/a"`) or globs (`"crates/*"`);
     /// `glob::glob` handles both shapes transparently.
@@ -263,6 +332,22 @@ impl Cargo {
             ));
         }
         topo_sort_members(pkgs)
+    }
+
+    /// Collect member manifest paths and the set of member crate names.
+    fn manifests_and_member_names(
+        root: &Path,
+        members: &[String],
+    ) -> Result<(Vec<PathBuf>, HashSet<String>)> {
+        let manifests = Self::member_manifests(root, members)?;
+        let mut names = HashSet::new();
+        for rel in &manifests {
+            let d = Self::read_member_doc(&root.join(rel))?;
+            if let Some(name) = Self::package_name_from_doc(&d) {
+                names.insert(name);
+            }
+        }
+        Ok((manifests, names))
     }
 
     fn publish_each_member(root: &Path, members: &[String]) -> Result<()> {
@@ -353,6 +438,12 @@ impl Backend for Cargo {
 
         match Self::classify(&doc) {
             Layout::WorkspacePackage => {
+                let ws_members = Self::workspace_members(&doc);
+                let (manifests, mut names) = Self::manifests_and_member_names(root, &ws_members)?;
+                if let Some(root_name) = Self::package_name_from_doc(&doc) {
+                    names.insert(root_name);
+                }
+
                 if let Some(ws) = doc
                     .get_mut("workspace")
                     .and_then(Item::as_table_mut)
@@ -361,8 +452,22 @@ impl Backend for Cargo {
                 {
                     ws["version"] = toml_edit::value(new);
                 }
+                // `workspace.package` may be absent on a malformed manifest;
+                // we still rewrite intra-dep versions and unconditionally write
+                // because `WorkspacePackage` implies `workspace.package.version`
+                // exists, but the write is cheap and keeps the logic simple.
+                let _ = rewrite_intra_workspace_dep_versions(&mut doc, &names, new);
                 fs::write(&path, doc.to_string())
                     .with_context(|| format!("write {}", path.display()))?;
+
+                for rel in manifests {
+                    let member_path = root.join(&rel);
+                    let mut member_doc = Self::read_member_doc(&member_path)?;
+                    if rewrite_intra_workspace_dep_versions(&mut member_doc, &names, new) {
+                        fs::write(&member_path, member_doc.to_string())
+                            .with_context(|| format!("write {}", member_path.display()))?;
+                    }
+                }
             }
             Layout::Package => {
                 let pkg = doc
@@ -374,18 +479,47 @@ impl Backend for Cargo {
                     .with_context(|| format!("write {}", path.display()))?;
             }
             Layout::VirtualOrMembers { members } => {
+                let (manifests, mut names) = Self::manifests_and_member_names(root, &members)?;
+                if let Some(root_name) = Self::package_name_from_doc(&doc) {
+                    names.insert(root_name);
+                }
+
                 // Virtual workspaces have no root `[package]`; in that case
                 // leave the root manifest untouched.
-                if let Some(pkg) = doc.get_mut("package").and_then(Item::as_table_mut)
-                    && pkg.contains_key("version")
+                let root_pkg_changed = if let Some(pkg) =
+                    doc.get_mut("package").and_then(Item::as_table_mut)
+                    && pkg.get("version").and_then(Item::as_str).is_some()
                 {
                     pkg["version"] = toml_edit::value(new);
+                    true
+                } else {
+                    false
+                };
+                let root_intra_changed =
+                    rewrite_intra_workspace_dep_versions(&mut doc, &names, new);
+                if root_pkg_changed || root_intra_changed {
                     fs::write(&path, doc.to_string())
                         .with_context(|| format!("write {}", path.display()))?;
                 }
-                for rel in Self::member_manifests(root, &members)? {
-                    Self::write_package_version(&root.join(&rel), new)
-                        .with_context(|| format!("update member {}", rel.display()))?;
+
+                for rel in manifests {
+                    let member_path = root.join(&rel);
+                    let mut member_doc = Self::read_member_doc(&member_path)?;
+                    let pkg_changed = if let Some(pkg) =
+                        member_doc.get_mut("package").and_then(Item::as_table_mut)
+                        && pkg.get("version").and_then(Item::as_str).is_some()
+                    {
+                        pkg["version"] = toml_edit::value(new);
+                        true
+                    } else {
+                        false
+                    };
+                    let intra_changed =
+                        rewrite_intra_workspace_dep_versions(&mut member_doc, &names, new);
+                    if pkg_changed || intra_changed {
+                        fs::write(&member_path, member_doc.to_string())
+                            .with_context(|| format!("write {}", member_path.display()))?;
+                    }
                 }
             }
         }
@@ -406,7 +540,12 @@ impl Backend for Cargo {
 
         match Self::read_doc(root) {
             Ok(doc) => {
-                if let Layout::VirtualOrMembers { members } = Self::classify(&doc) {
+                let members_opt = match Self::classify(&doc) {
+                    Layout::VirtualOrMembers { members } => Some(members),
+                    Layout::WorkspacePackage => Some(Self::workspace_members(&doc)),
+                    Layout::Package => None,
+                };
+                if let Some(members) = members_opt {
                     match Self::member_manifests(root, &members) {
                         Ok(children) => v.extend(children),
                         Err(e) => eprintln!(
@@ -455,6 +594,52 @@ impl Backend for Cargo {
             }
             Layout::Package => Ok(Some("cargo publish".into())),
             Layout::VirtualOrMembers { members } => Self::member_publish_preview(root, &members),
+        }
+    }
+
+    fn additional_write_previews(&self, root: &Path, new: &str) -> Result<Vec<PathBuf>> {
+        let doc = Self::read_doc(root)?;
+        match Self::classify(&doc) {
+            Layout::Package => Ok(vec![]),
+            Layout::WorkspacePackage => {
+                let ws_members = Self::workspace_members(&doc);
+                let (manifests, mut names) = Self::manifests_and_member_names(root, &ws_members)?;
+                if let Some(root_name) = Self::package_name_from_doc(&doc) {
+                    names.insert(root_name);
+                }
+                let mut out = vec![];
+                for rel in manifests {
+                    let member_path = root.join(&rel);
+                    let mut member_doc = Self::read_member_doc(&member_path)?;
+                    if rewrite_intra_workspace_dep_versions(&mut member_doc, &names, new) {
+                        out.push(rel);
+                    }
+                }
+                Ok(out)
+            }
+            Layout::VirtualOrMembers { members } => {
+                let (manifests, mut names) = Self::manifests_and_member_names(root, &members)?;
+                if let Some(root_name) = Self::package_name_from_doc(&doc) {
+                    names.insert(root_name);
+                }
+                let mut out = vec![];
+                for rel in manifests {
+                    let member_path = root.join(&rel);
+                    let mut member_doc = Self::read_member_doc(&member_path)?;
+                    let intra_changed =
+                        rewrite_intra_workspace_dep_versions(&mut member_doc, &names, new);
+                    let pkg_changed = member_doc
+                        .get("package")
+                        .and_then(Item::as_table)
+                        .and_then(|t| t.get("version"))
+                        .and_then(Item::as_str)
+                        .is_some();
+                    if pkg_changed || intra_changed {
+                        out.push(rel);
+                    }
+                }
+                Ok(out)
+            }
         }
     }
 }
@@ -764,6 +949,305 @@ mod tests {
             .find("publish -p c")
             .ok_or_else(|| anyhow!("c not in {preview}"))?;
         assert!(a < b && b < c, "expected a < b < c in {preview}");
+        Ok(())
+    }
+
+    // --- intra-workspace dependency version rewrite tests ---
+
+    #[test]
+    fn workspace_package_layout_updates_intra_dep_versions() -> Result<()> {
+        // Given: [workspace.package].version layout with members A and B,
+        // where B has a path+version dependency on A
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/a\", \"crates/b\"]\n\n[workspace.package]\nversion = \"1.0.0\"\n",
+        )?;
+        fs::create_dir_all(root.join("crates/a"))?;
+        fs::create_dir_all(root.join("crates/b"))?;
+        fs::write(
+            root.join("crates/a/Cargo.toml"),
+            "[package]\nname = \"a\"\nversion.workspace = true\n",
+        )?;
+        fs::write(
+            root.join("crates/b/Cargo.toml"),
+            "[package]\nname = \"b\"\nversion.workspace = true\n\n[dependencies]\na = { path = \"../a\", version = \"1.0.0\" }\n",
+        )?;
+
+        // When: bumping to 1.1.0
+        let backend = Cargo;
+        backend.write_version(root, "1.1.0")?;
+
+        // Then: central version is updated AND B's intra-dep version requirement tracks
+        let root_after = fs::read_to_string(root.join("Cargo.toml"))?;
+        assert!(
+            root_after.contains("version = \"1.1.0\""),
+            "central version not updated: {root_after}"
+        );
+        let b_after = fs::read_to_string(root.join("crates/b/Cargo.toml"))?;
+        assert!(
+            b_after.contains("version = \"1.1.0\""),
+            "intra-dep version not updated in B: {b_after}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn virtual_workspace_layout_updates_intra_dep_versions() -> Result<()> {
+        // Given: virtual workspace with members A and B,
+        // where B has a path+version dependency on A
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/a\", \"crates/b\"]\nresolver = \"2\"\n",
+        )?;
+        fs::create_dir_all(root.join("crates/a"))?;
+        fs::create_dir_all(root.join("crates/b"))?;
+        fs::write(
+            root.join("crates/a/Cargo.toml"),
+            "[package]\nname = \"a\"\nversion = \"1.0.0\"\n",
+        )?;
+        fs::write(
+            root.join("crates/b/Cargo.toml"),
+            "[package]\nname = \"b\"\nversion = \"1.0.0\"\n\n[dependencies]\na = { path = \"../a\", version = \"1.0.0\" }\n",
+        )?;
+
+        // When: bumping to 1.1.0
+        let backend = Cargo;
+        backend.write_version(root, "1.1.0")?;
+
+        // Then: both member package versions and B's intra-dep version are updated.
+        let b_after = fs::read_to_string(root.join("crates/b/Cargo.toml"))?;
+        assert!(
+            b_after.contains("version = \"1.1.0\""),
+            "package version not updated in B: {b_after}"
+        );
+        assert!(
+            b_after.contains("a = { path = \"../a\", version = \"1.1.0\" }"),
+            "intra-dep version not updated in B: {b_after}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn intra_dep_without_version_key_is_not_modified() -> Result<()> {
+        // Given: member B depends on A with path only -- no version key
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/a\", \"crates/b\"]\nresolver = \"2\"\n",
+        )?;
+        fs::create_dir_all(root.join("crates/a"))?;
+        fs::create_dir_all(root.join("crates/b"))?;
+        fs::write(
+            root.join("crates/a/Cargo.toml"),
+            "[package]\nname = \"a\"\nversion = \"1.0.0\"\n",
+        )?;
+        fs::write(
+            root.join("crates/b/Cargo.toml"),
+            "[package]\nname = \"b\"\nversion = \"1.0.0\"\n\n[dependencies]\na = { path = \"../a\" }\n",
+        )?;
+
+        // When: bumping to 1.1.0
+        let backend = Cargo;
+        backend.write_version(root, "1.1.0")?;
+
+        // Then: B's path-only dependency must not gain a new version key
+        let b_after = fs::read_to_string(root.join("crates/b/Cargo.toml"))?;
+        assert!(
+            b_after.contains("a = { path = \"../a\" }"),
+            "path-only dep was unexpectedly modified: {b_after}"
+        );
+        assert!(
+            !b_after.contains("a = { path = \"../a\", version"),
+            "version key was wrongly added to path-only dep: {b_after}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn external_dependencies_are_not_modified_on_version_bump() -> Result<()> {
+        // Given: member B has an external dep (serde) alongside an intra-workspace dep
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/a\", \"crates/b\"]\nresolver = \"2\"\n",
+        )?;
+        fs::create_dir_all(root.join("crates/a"))?;
+        fs::create_dir_all(root.join("crates/b"))?;
+        fs::write(
+            root.join("crates/a/Cargo.toml"),
+            "[package]\nname = \"a\"\nversion = \"1.0.0\"\n",
+        )?;
+        fs::write(
+            root.join("crates/b/Cargo.toml"),
+            "[package]\nname = \"b\"\nversion = \"1.0.0\"\n\n[dependencies]\nserde = \"1\"\na = { path = \"../a\", version = \"1.0.0\" }\n",
+        )?;
+
+        // When: bumping to 1.1.0
+        let backend = Cargo;
+        backend.write_version(root, "1.1.0")?;
+
+        // Then: external dep serde is untouched; both [package].version and the
+        // intra-dep requirement are updated.
+        let b_after = fs::read_to_string(root.join("crates/b/Cargo.toml"))?;
+        assert!(
+            b_after.contains("serde = \"1\""),
+            "external dep serde was unexpectedly modified: {b_after}"
+        );
+        assert!(
+            b_after.contains("version = \"1.1.0\""),
+            "package version not updated in B: {b_after}"
+        );
+        assert!(
+            b_after.contains("a = { path = \"../a\", version = \"1.1.0\" }"),
+            "intra-dep version not updated in B: {b_after}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn renamed_intra_dep_is_updated_via_package_field() -> Result<()> {
+        // Given: member B depends on A using an alias key with package = "a"
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/a\", \"crates/b\"]\nresolver = \"2\"\n",
+        )?;
+        fs::create_dir_all(root.join("crates/a"))?;
+        fs::create_dir_all(root.join("crates/b"))?;
+        fs::write(
+            root.join("crates/a/Cargo.toml"),
+            "[package]\nname = \"a\"\nversion = \"1.0.0\"\n",
+        )?;
+        fs::write(
+            root.join("crates/b/Cargo.toml"),
+            "[package]\nname = \"b\"\nversion = \"1.0.0\"\n\n[dependencies]\na_alias = { package = \"a\", path = \"../a\", version = \"1.0.0\" }\n",
+        )?;
+
+        // When: bumping to 1.1.0
+        let backend = Cargo;
+        backend.write_version(root, "1.1.0")?;
+
+        // Then: the real crate name "a" is a workspace member, so the aliased
+        // dependency's version requirement must also be updated.
+        let b_after = fs::read_to_string(root.join("crates/b/Cargo.toml"))?;
+        assert!(
+            b_after.contains("version = \"1.1.0\""),
+            "package version not updated in B: {b_after}"
+        );
+        assert!(
+            b_after.contains("a_alias = { package = \"a\", path = \"../a\", version = \"1.1.0\" }"),
+            "aliased intra-dep version not updated in B: {b_after}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn shorthand_intra_dep_version_is_updated() -> Result<()> {
+        // Given: member B depends on A using plain-string shorthand `a = "1.0.0"`
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/a\", \"crates/b\"]\nresolver = \"2\"\n",
+        )?;
+        fs::create_dir_all(root.join("crates/a"))?;
+        fs::create_dir_all(root.join("crates/b"))?;
+        fs::write(
+            root.join("crates/a/Cargo.toml"),
+            "[package]\nname = \"a\"\nversion = \"1.0.0\"\n",
+        )?;
+        fs::write(
+            root.join("crates/b/Cargo.toml"),
+            "[package]\nname = \"b\"\nversion = \"1.0.0\"\n\n[dependencies]\na = \"1.0.0\"\n",
+        )?;
+
+        // When: bumping to 1.1.0
+        let backend = Cargo;
+        backend.write_version(root, "1.1.0")?;
+
+        // Then: the shorthand version string must also be updated
+        let b_after = fs::read_to_string(root.join("crates/b/Cargo.toml"))?;
+        assert!(
+            b_after.contains("a = \"1.1.0\""),
+            "shorthand intra-dep version not updated: {b_after}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn root_crate_dep_version_is_updated_in_member() -> Result<()> {
+        // Given: workspace root is also a crate, and a member depends on it
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/a\"]\n\n[package]\nname = \"root-crate\"\nversion = \"1.0.0\"\n",
+        )?;
+        fs::create_dir_all(root.join("crates/a"))?;
+        fs::write(
+            root.join("crates/a/Cargo.toml"),
+            "[package]\nname = \"a\"\nversion = \"1.0.0\"\n\n[dependencies]\nroot-crate = { path = \"../..\", version = \"1.0.0\" }\n",
+        )?;
+
+        // When: bumping to 1.1.0
+        let backend = Cargo;
+        backend.write_version(root, "1.1.0")?;
+
+        // Then: the member's version requirement on the root crate must be updated
+        let a_after = fs::read_to_string(root.join("crates/a/Cargo.toml"))?;
+        assert!(
+            a_after.contains("root-crate = { path = \"../..\", version = \"1.1.0\" }"),
+            "member's dep version on root crate not updated: {a_after}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_dependencies_table_intra_dep_version_is_updated() -> Result<()> {
+        // Given: root uses [workspace.dependencies] to centralize path+version for A
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        fs::write(
+            root.join("Cargo.toml"),
+            concat!(
+                "[workspace]\nmembers = [\"crates/a\", \"crates/b\"]\n\n",
+                "[workspace.package]\nversion = \"1.0.0\"\n\n",
+                "[workspace.dependencies]\na = { path = \"crates/a\", version = \"1.0.0\" }\n",
+            ),
+        )?;
+        fs::create_dir_all(root.join("crates/a"))?;
+        fs::create_dir_all(root.join("crates/b"))?;
+        fs::write(
+            root.join("crates/a/Cargo.toml"),
+            "[package]\nname = \"a\"\nversion.workspace = true\n",
+        )?;
+        fs::write(
+            root.join("crates/b/Cargo.toml"),
+            "[package]\nname = \"b\"\nversion.workspace = true\n\n[dependencies]\na.workspace = true\n",
+        )?;
+
+        // When: bumping to 1.1.0
+        let backend = Cargo;
+        backend.write_version(root, "1.1.0")?;
+
+        // Then: [workspace.package].version is updated AND [workspace.dependencies].a's
+        // version requirement also tracks the new version.
+        let root_after = fs::read_to_string(root.join("Cargo.toml"))?;
+        assert!(
+            root_after.contains("version = \"1.1.0\""),
+            "workspace.package.version not updated: {root_after}"
+        );
+        assert!(
+            root_after.contains("a = { path = \"crates/a\", version = \"1.1.0\" }"),
+            "workspace.dependencies.a version not updated: {root_after}"
+        );
         Ok(())
     }
 }
