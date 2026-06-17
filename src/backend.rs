@@ -66,4 +66,18 @@ pub trait Backend {
     fn additional_write_previews(&self, _root: &Path, _new: &str) -> Result<Vec<PathBuf>> {
         Ok(vec![])
     }
+
+    /// Whether this backend has anything to publish under `root`. Used to honor
+    /// native "do not publish" fields in package manifests (cargo's
+    /// `[package].publish = false`, npm's `"private": true`) so that the publish
+    /// step is silently skipped instead of running and failing. Returns `true`
+    /// by default; backends without a meaningful publish step (go, julia) keep
+    /// the default because the publish step is already a no-op for them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the manifest cannot be read or parsed.
+    fn is_publishable(&self, _root: &Path) -> Result<bool> {
+        Ok(true)
+    }
 }

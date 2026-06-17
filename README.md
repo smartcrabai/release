@@ -83,6 +83,24 @@ For `bun`, publishable workspace packages are published in dependency order
 in the dependency graph abort the publish step. `pnpm` delegates ordering to
 `pnpm -r publish`, which already publishes in topological order.
 
+## Skipping publish via manifest fields
+
+In addition to the `--no-publish` flag, the tool honors each package manager's
+native "do not publish" marker. When every package targeted by the publish step
+is marked non-publishable, the step is silently skipped (a friendly notice is
+printed) instead of running and erroring out.
+
+| Backend | Marker                                                                              |
+| ------- | ----------------------------------------------------------------------------------- |
+| cargo   | `[package].publish = false` or `publish = []` (also resolves `publish.workspace = true` against `[workspace.package].publish`) |
+| pnpm    | `"private": true` in `package.json`                                                 |
+| bun     | `"private": true` in `package.json`                                                 |
+
+For workspace setups the per-member marker is respected: publishable members
+are published while non-publishable members are filtered out. The publish step
+runs only when at least one package would actually be published. uv, dotnet,
+julia, and go currently leave publish decisions to the underlying tool itself.
+
 ## Git workflow
 
 For every backend the tool:
