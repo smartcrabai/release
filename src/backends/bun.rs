@@ -44,9 +44,6 @@ fn bun_child_package_jsons(root: &Path) -> Result<Vec<PathBuf>> {
     child_package_jsons(root, &patterns)
 }
 
-const NO_PUBLISHABLE_PACKAGES: &str =
-    "no publishable packages: every package.json is private or missing a version";
-
 const DEP_KEYS: [&str; 4] = [
     "dependencies",
     "devDependencies",
@@ -360,10 +357,7 @@ impl Backend for Bun {
     fn publish(&self, root: &Path) -> Result<()> {
         let dirs = publish_dirs(root)?;
         if dirs.is_empty() {
-            return Err(anyhow!(
-                "{NO_PUBLISHABLE_PACKAGES} (under {})",
-                root.display()
-            ));
+            return Ok(());
         }
         super::ensure_npm_login(root, "bun", &["pm", "whoami"])?;
         for d in dirs {
@@ -375,7 +369,7 @@ impl Backend for Bun {
     fn publish_command_preview(&self, root: &Path) -> Result<Option<String>> {
         let dirs = publish_dirs(root)?;
         if dirs.is_empty() {
-            return Ok(Some(format!("({NO_PUBLISHABLE_PACKAGES})")));
+            return Ok(None);
         }
         if dirs.len() == 1 && dirs[0].as_os_str().is_empty() {
             return Ok(Some("bun publish".into()));
@@ -392,6 +386,10 @@ impl Backend for Bun {
             })
             .collect();
         Ok(Some(parts.join(" && ")))
+    }
+
+    fn is_publishable(&self, root: &Path) -> Result<bool> {
+        Ok(!publish_dirs(root)?.is_empty())
     }
 }
 
@@ -622,29 +620,21 @@ mod tests {
     }
 
     #[test]
-    fn publish_preview_single_private_package_errors() -> Result<()> {
+    fn private_single_package_is_not_publishable() -> Result<()> {
         let tmp = tempfile::tempdir()?;
         fs::write(
             tmp.path().join("package.json"),
             "{ \"name\": \"solo\", \"version\": \"1.0.0\", \"private\": true }\n",
         )?;
         let backend = Bun;
-        let preview = backend
-            .publish_command_preview(tmp.path())?
-            .unwrap_or_default();
-        assert!(preview.contains("no publishable packages"), "{preview}");
-        match backend.publish(tmp.path()) {
-            Err(e) => assert!(
-                format!("{e}").contains("no publishable packages"),
-                "got {e}"
-            ),
-            Ok(()) => panic!("expected publish to error for private root package"),
-        }
+        assert!(!backend.is_publishable(tmp.path())?);
+        assert_eq!(backend.publish_command_preview(tmp.path())?, None);
+        backend.publish(tmp.path())?;
         Ok(())
     }
 
     #[test]
-    fn publish_preview_workspace_no_publishable_packages() -> Result<()> {
+    fn workspace_with_all_private_packages_is_not_publishable() -> Result<()> {
         let tmp = tempfile::tempdir()?;
         let root = tmp.path();
         fs::write(
@@ -658,15 +648,9 @@ mod tests {
         )?;
 
         let backend = Bun;
-        let preview = backend.publish_command_preview(root)?.unwrap_or_default();
-        assert!(preview.contains("no publishable packages"), "{preview}");
-        match backend.publish(root) {
-            Err(e) => assert!(
-                format!("{e}").contains("no publishable packages"),
-                "got {e}"
-            ),
-            Ok(()) => panic!("expected publish to error when no packages are publishable"),
-        }
+        assert!(!backend.is_publishable(root)?);
+        assert_eq!(backend.publish_command_preview(root)?, None);
+        backend.publish(root)?;
         Ok(())
     }
 

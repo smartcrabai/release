@@ -27,6 +27,55 @@ struct MemberPkg {
     intra_deps: Vec<String>,
 }
 
+/// Interpret a Cargo `publish` value. Returns `None` when `value` is the
+/// `{ workspace = true }` inheritance marker (the caller should resolve it
+/// against `[workspace.package].publish`); otherwise returns the resolved
+/// publishability per cargo's rules:
+/// - `true` / `["registry", ...]`: publishable
+/// - `false` / `[]`: not publishable
+/// - any other shape (malformed): treated as publishable (default)
+fn interpret_publish_value(value: &Item) -> Option<bool> {
+    if let Some(t) = value.as_table_like()
+        && t.get("workspace").and_then(Item::as_bool) == Some(true)
+    {
+        return None;
+    }
+    if let Some(b) = value.as_bool() {
+        return Some(b);
+    }
+    if let Some(arr) = value.as_array() {
+        return Some(arr.iter().any(|v| v.as_str().is_some()));
+    }
+    Some(true)
+}
+
+/// Read `[workspace.package].publish`. Defaults to `true` when missing.
+/// Uses `as_table_like` so inline-table forms (e.g. `workspace = { package = { publish = false } }`)
+/// are detected too.
+fn workspace_package_publish(doc: &DocumentMut) -> bool {
+    doc.get("workspace")
+        .and_then(Item::as_table_like)
+        .and_then(|t| t.get("package"))
+        .and_then(Item::as_table_like)
+        .and_then(|t| t.get("publish"))
+        .and_then(interpret_publish_value)
+        .unwrap_or(true)
+}
+
+/// Returns `true` when a parsed Cargo manifest's `[package]` table is a
+/// candidate for `cargo publish`. Resolves `publish.workspace = true` against
+/// the supplied root manifest. Manifests without a `[package]` table
+/// (virtual workspace roots) are not publishable by themselves.
+fn is_doc_package_publishable(doc: &DocumentMut, root_doc: &DocumentMut) -> bool {
+    let Some(pkg) = doc.get("package").and_then(Item::as_table_like) else {
+        return false;
+    };
+    let Some(publish) = pkg.get("publish") else {
+        return true;
+    };
+    interpret_publish_value(publish).unwrap_or_else(|| workspace_package_publish(root_doc))
+}
+
 /// Collect the dependency names referenced in a single dependency table.
 ///
 /// Handles both the shorthand form (`foo = "1"`) and the detailed form
@@ -354,8 +403,27 @@ impl Cargo {
         Ok((manifests, names))
     }
 
+    /// Returns the subset of workspace members whose manifest is publishable
+    /// (i.e. `[package].publish != false` and not `publish = []`), preserving
+    /// the topological order from `ordered_member_names`.
+    fn publishable_ordered_members(
+        root: &Path,
+        members: &[String],
+    ) -> Result<Vec<(PathBuf, MemberPkg)>> {
+        let root_doc = Self::read_doc(root)?;
+        let ordered = Self::ordered_member_names(root, members)?;
+        let mut out = Vec::with_capacity(ordered.len());
+        for (rel, pkg) in ordered {
+            let doc = Self::read_member_doc(&root.join(&rel))?;
+            if is_doc_package_publishable(&doc, &root_doc) {
+                out.push((rel, pkg));
+            }
+        }
+        Ok(out)
+    }
+
     fn publish_each_member(root: &Path, members: &[String]) -> Result<()> {
-        for (rel, pkg) in Self::ordered_member_names(root, members)? {
+        for (rel, pkg) in Self::publishable_ordered_members(root, members)? {
             let Some(name) = pkg.name else {
                 eprintln!(
                     "warning: skipping publish of {} (no [package].name)",
@@ -370,13 +438,13 @@ impl Cargo {
 
     fn member_publish_preview(root: &Path, members: &[String]) -> Result<Option<String>> {
         let mut names: Vec<String> = Vec::new();
-        for (_, pkg) in Self::ordered_member_names(root, members)? {
+        for (_, pkg) in Self::publishable_ordered_members(root, members)? {
             if let Some(n) = pkg.name {
                 names.push(n);
             }
         }
         if names.is_empty() {
-            Ok(Some("cargo publish".into()))
+            Ok(None)
         } else {
             let joined = names
                 .iter()
@@ -574,14 +642,19 @@ impl Backend for Cargo {
     fn publish(&self, root: &Path) -> Result<()> {
         let doc = Self::read_doc(root)?;
         match Self::classify(&doc) {
-            Layout::WorkspacePackage => {
-                if let Some(name) = Self::package_name_from_doc(&doc) {
+            Layout::WorkspacePackage => match Self::package_name_from_doc(&doc) {
+                Some(name) if is_doc_package_publishable(&doc, &doc) => {
                     super::run(root, "cargo", &["publish", "-p", &name])
+                }
+                _ => Self::publish_each_member(root, &Self::workspace_members(&doc)),
+            },
+            Layout::Package => {
+                if is_doc_package_publishable(&doc, &doc) {
+                    super::run(root, "cargo", &["publish"])
                 } else {
-                    Self::publish_each_member(root, &Self::workspace_members(&doc))
+                    Ok(())
                 }
             }
-            Layout::Package => super::run(root, "cargo", &["publish"]),
             Layout::VirtualOrMembers { members } => Self::publish_each_member(root, &members),
         }
     }
@@ -589,16 +662,25 @@ impl Backend for Cargo {
     fn publish_command_preview(&self, root: &Path) -> Result<Option<String>> {
         let doc = Self::read_doc(root)?;
         match Self::classify(&doc) {
-            Layout::WorkspacePackage => {
-                if let Some(name) = Self::package_name_from_doc(&doc) {
+            Layout::WorkspacePackage => match Self::package_name_from_doc(&doc) {
+                Some(name) if is_doc_package_publishable(&doc, &doc) => {
                     Ok(Some(format!("cargo publish -p {name}")))
+                }
+                _ => Self::member_publish_preview(root, &Self::workspace_members(&doc)),
+            },
+            Layout::Package => {
+                if is_doc_package_publishable(&doc, &doc) {
+                    Ok(Some("cargo publish".into()))
                 } else {
-                    Self::member_publish_preview(root, &Self::workspace_members(&doc))
+                    Ok(None)
                 }
             }
-            Layout::Package => Ok(Some("cargo publish".into())),
             Layout::VirtualOrMembers { members } => Self::member_publish_preview(root, &members),
         }
+    }
+
+    fn is_publishable(&self, root: &Path) -> Result<bool> {
+        Ok(self.publish_command_preview(root)?.is_some())
     }
 
     fn additional_write_previews(&self, root: &Path, new: &str) -> Result<Vec<PathBuf>> {
@@ -1261,5 +1343,170 @@ mod tests {
     fn lockfile_command_preview_returns_update_workspace() {
         let preview = Cargo.lockfile_command_preview();
         assert_eq!(preview, Some("cargo update --workspace".into()));
+    }
+
+    // --- publish gating via [package].publish ---
+
+    #[test]
+    fn single_package_with_publish_false_is_not_publishable() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\npublish = false\n",
+        )?;
+        let b = Cargo;
+        assert!(!b.is_publishable(tmp.path())?);
+        assert_eq!(b.publish_command_preview(tmp.path())?, None);
+        // publish() must be a no-op (no `cargo` invocation) when `publish = false`.
+        b.publish(tmp.path())?;
+        Ok(())
+    }
+
+    #[test]
+    fn single_package_with_empty_publish_array_is_not_publishable() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\npublish = []\n",
+        )?;
+        let b = Cargo;
+        assert!(!b.is_publishable(tmp.path())?);
+        Ok(())
+    }
+
+    #[test]
+    fn single_package_with_publish_registries_is_publishable() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\npublish = [\"my-registry\"]\n",
+        )?;
+        let b = Cargo;
+        assert!(b.is_publishable(tmp.path())?);
+        Ok(())
+    }
+
+    #[test]
+    fn virtual_workspace_filters_publish_false_members() -> Result<()> {
+        // a is publishable, b has publish = false.
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/a\", \"crates/b\"]\nresolver = \"2\"\n",
+        )?;
+        fs::create_dir_all(root.join("crates/a"))?;
+        fs::create_dir_all(root.join("crates/b"))?;
+        fs::write(
+            root.join("crates/a/Cargo.toml"),
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n",
+        )?;
+        fs::write(
+            root.join("crates/b/Cargo.toml"),
+            "[package]\nname = \"b\"\nversion = \"0.1.0\"\npublish = false\n",
+        )?;
+
+        let b = Cargo;
+        let preview = b.publish_command_preview(root)?.unwrap_or_default();
+        assert!(preview.contains("cargo publish -p a"), "{preview}");
+        assert!(!preview.contains("publish -p b"), "{preview}");
+        Ok(())
+    }
+
+    #[test]
+    fn virtual_workspace_all_members_publish_false_is_not_publishable() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/a\"]\nresolver = \"2\"\n",
+        )?;
+        fs::create_dir_all(root.join("crates/a"))?;
+        fs::write(
+            root.join("crates/a/Cargo.toml"),
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\npublish = false\n",
+        )?;
+
+        let b = Cargo;
+        assert!(!b.is_publishable(root)?);
+        Ok(())
+    }
+
+    #[test]
+    fn inline_workspace_package_publish_false_is_honored() -> Result<()> {
+        // Inline-table form: workspace = { package = { ... publish = false }, ... }
+        // Members that inherit via `publish.workspace = true` must still be detected as non-publishable.
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        fs::write(
+            root.join("Cargo.toml"),
+            "workspace = { members = [\"crates/a\"], package = { version = \"1.0.0\", publish = false } }\n",
+        )?;
+        fs::create_dir_all(root.join("crates/a"))?;
+        fs::write(
+            root.join("crates/a/Cargo.toml"),
+            "[package]\nname = \"a\"\nversion.workspace = true\npublish.workspace = true\n",
+        )?;
+
+        let b = Cargo;
+        assert!(!b.is_publishable(root)?);
+        Ok(())
+    }
+
+    #[test]
+    fn inline_package_publish_false_is_honored() -> Result<()> {
+        // Inline-table form for a single crate's [package].
+        let tmp = tempfile::tempdir()?;
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "package = { name = \"demo\", version = \"0.1.0\", publish = false }\n",
+        )?;
+        let b = Cargo;
+        assert!(!b.is_publishable(tmp.path())?);
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_package_root_publish_false_falls_back_to_members() -> Result<()> {
+        // Root has a [package] but it's publish=false; one member is still publishable.
+        // The preview and publish must agree: publish each publishable member, not silently skip.
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/a\"]\n\n[workspace.package]\nversion = \"1.0.0\"\n\n[package]\nname = \"root\"\nversion.workspace = true\npublish = false\n",
+        )?;
+        fs::create_dir_all(root.join("crates/a"))?;
+        fs::write(
+            root.join("crates/a/Cargo.toml"),
+            "[package]\nname = \"a\"\nversion.workspace = true\n",
+        )?;
+
+        let b = Cargo;
+        assert!(b.is_publishable(root)?);
+        let preview = b.publish_command_preview(root)?.unwrap_or_default();
+        assert!(preview.contains("cargo publish -p a"), "{preview}");
+        assert!(!preview.contains("cargo publish -p root"), "{preview}");
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_package_layout_member_inherits_publish_false() -> Result<()> {
+        // [workspace.package] sets publish = false; member uses publish.workspace = true.
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/a\"]\n\n[workspace.package]\nversion = \"1.0.0\"\npublish = false\n",
+        )?;
+        fs::create_dir_all(root.join("crates/a"))?;
+        fs::write(
+            root.join("crates/a/Cargo.toml"),
+            "[package]\nname = \"a\"\nversion.workspace = true\npublish.workspace = true\n",
+        )?;
+
+        let b = Cargo;
+        assert!(!b.is_publishable(root)?);
+        Ok(())
     }
 }

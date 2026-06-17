@@ -290,7 +290,28 @@ impl Backend for Pnpm {
     }
 
     fn publish_command_preview(&self, root: &Path) -> Result<Option<String>> {
+        if !self.is_publishable(root)? {
+            return Ok(None);
+        }
         Ok(Some(format!("pnpm {}", pnpm_publish_args(root)?.join(" "))))
+    }
+
+    fn is_publishable(&self, root: &Path) -> Result<bool> {
+        let root_pkg = root.join("package.json");
+        let root_publishable = if root_pkg.is_file() {
+            is_package_json_publishable(&root_pkg)?
+        } else {
+            false
+        };
+        if root_publishable {
+            return Ok(true);
+        }
+        for rel in pnpm_child_package_jsons(root)? {
+            if is_package_json_publishable(&root.join(&rel))? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -476,6 +497,70 @@ mod tests {
             backend.publish_command_preview(root)?,
             Some("pnpm -r publish --no-git-checks".into())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn private_single_package_is_not_publishable() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        fs::write(
+            tmp.path().join("package.json"),
+            "{ \"name\": \"solo\", \"version\": \"1.0.0\", \"private\": true }\n",
+        )?;
+        let backend = Pnpm;
+        assert!(!backend.is_publishable(tmp.path())?);
+        assert_eq!(backend.publish_command_preview(tmp.path())?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_with_all_private_packages_is_not_publishable() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        fs::write(
+            root.join("package.json"),
+            "{ \"name\": \"root\", \"private\": true }\n",
+        )?;
+        fs::write(
+            root.join("pnpm-workspace.yaml"),
+            "packages:\n  - \"packages/*\"\n",
+        )?;
+        fs::create_dir_all(root.join("packages/a"))?;
+        fs::write(
+            root.join("packages/a/package.json"),
+            "{ \"name\": \"@x/a\", \"version\": \"0.1.0\", \"private\": true }\n",
+        )?;
+
+        let backend = Pnpm;
+        assert!(!backend.is_publishable(root)?);
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_with_one_publishable_child_is_publishable() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        fs::write(
+            root.join("package.json"),
+            "{ \"name\": \"root\", \"private\": true }\n",
+        )?;
+        fs::write(
+            root.join("pnpm-workspace.yaml"),
+            "packages:\n  - \"packages/*\"\n",
+        )?;
+        fs::create_dir_all(root.join("packages/pub"))?;
+        fs::create_dir_all(root.join("packages/priv"))?;
+        fs::write(
+            root.join("packages/pub/package.json"),
+            "{ \"name\": \"@x/pub\", \"version\": \"0.1.0\" }\n",
+        )?;
+        fs::write(
+            root.join("packages/priv/package.json"),
+            "{ \"name\": \"@x/priv\", \"version\": \"0.1.0\", \"private\": true }\n",
+        )?;
+
+        let backend = Pnpm;
+        assert!(backend.is_publishable(root)?);
         Ok(())
     }
 }

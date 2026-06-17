@@ -136,6 +136,16 @@ pub fn run_with(cli: &Cli, root: &Path) -> Result<()> {
 }
 
 fn run_publish(backend: &dyn Backend, root: &Path, dry_run: bool) -> Result<()> {
+    if !backend
+        .is_publishable(root)
+        .with_context(|| format!("check publishability with backend '{}'", backend.name()))?
+    {
+        println!(
+            "Skipping publish: no publishable packages found (backend: {}).",
+            backend.name()
+        );
+        return Ok(());
+    }
     if dry_run {
         if let Some(cmd) = backend.publish_command_preview(root)? {
             println!("would run: {cmd}");
