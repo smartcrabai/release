@@ -298,7 +298,7 @@ impl Cargo {
     fn workspace_members(doc: &DocumentMut) -> Vec<String> {
         let Some(members) = doc
             .get("workspace")
-            .and_then(Item::as_table)
+            .and_then(Item::as_table_like)
             .and_then(|t| t.get("members"))
             .and_then(Item::as_array)
         else {
@@ -312,9 +312,9 @@ impl Cargo {
 
     fn has_workspace_package_version(doc: &DocumentMut) -> bool {
         doc.get("workspace")
-            .and_then(Item::as_table)
+            .and_then(Item::as_table_like)
             .and_then(|t| t.get("package"))
-            .and_then(Item::as_table)
+            .and_then(Item::as_table_like)
             .is_some_and(|t| t.contains_key("version"))
     }
 
@@ -322,11 +322,17 @@ impl Cargo {
         if Self::has_workspace_package_version(doc) {
             return Layout::WorkspacePackage;
         }
-        let has_workspace = doc.get("workspace").is_some();
-        if has_workspace {
-            return Layout::VirtualOrMembers {
-                members: Self::workspace_members(doc),
-            };
+        if doc.get("workspace").is_some() {
+            let members = Self::workspace_members(doc);
+            // When `[workspace]` has no explicit members and `[package]` is present,
+            // treat this as a plain single-crate package. This covers patterns like
+            // cargo-dist's `[workspace.metadata.dist]`, an explicit `members = []`,
+            // or `exclude = [...]` used only to suppress auto-discovery warnings —
+            // none of which imply a multi-package workspace.
+            if members.is_empty() && doc.get("package").is_some() {
+                return Layout::Package;
+            }
+            return Layout::VirtualOrMembers { members };
         }
         Layout::Package
     }
@@ -1507,6 +1513,166 @@ mod tests {
 
         let b = Cargo;
         assert!(!b.is_publishable(root)?);
+        Ok(())
+    }
+
+    // --- [workspace.metadata.*]-only single package classification ---
+
+    #[test]
+    fn package_with_workspace_metadata_only_is_publishable() -> Result<()> {
+        // Given: a single-package Cargo.toml that adds [workspace.metadata.dist]
+        // (a common cargo-dist pattern), with no workspace members.
+        let tmp = tempfile::tempdir()?;
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.2.3\"\n\n[workspace.metadata.dist]\ncargo-dist-version = \"0.22.1\"\n",
+        )?;
+        let b = Cargo;
+        // When: checking publishability and the publish command preview.
+        // Then: the package is publishable and the command is plain `cargo publish`.
+        assert!(b.is_publishable(tmp.path())?);
+        assert_eq!(
+            b.publish_command_preview(tmp.path())?,
+            Some("cargo publish".into())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn package_with_workspace_metadata_only_read_version() -> Result<()> {
+        // Given: a single-package Cargo.toml with [workspace.metadata.dist].
+        let tmp = tempfile::tempdir()?;
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.2.3\"\n\n[workspace.metadata.dist]\ncargo-dist-version = \"0.22.1\"\n",
+        )?;
+        let b = Cargo;
+        // When: reading the version.
+        // Then: the value comes from [package].version unchanged.
+        assert_eq!(b.read_version(tmp.path())?, "0.2.3");
+        Ok(())
+    }
+
+    #[test]
+    fn package_with_workspace_metadata_only_write_version() -> Result<()> {
+        // Given: a single-package Cargo.toml with [workspace.metadata.dist].
+        let tmp = tempfile::tempdir()?;
+        let manifest = tmp.path().join("Cargo.toml");
+        fs::write(
+            &manifest,
+            "[package]\nname = \"demo\"\nversion = \"0.2.3\"\n\n[workspace.metadata.dist]\ncargo-dist-version = \"0.22.1\"\n",
+        )?;
+        let b = Cargo;
+        // When: bumping the version.
+        b.write_version(tmp.path(), "0.2.4")?;
+        // Then: the new version is written.
+        let content = fs::read_to_string(&manifest)?;
+        assert!(
+            content.contains("version = \"0.2.4\""),
+            "expected new version in manifest: {content}"
+        );
+        // And: [workspace.metadata.dist] keys are preserved (toml_edit round-trips them).
+        assert!(
+            content.contains("cargo-dist-version"),
+            "workspace.metadata.dist must be preserved: {content}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn package_with_workspace_metadata_only_files_to_stage() -> Result<()> {
+        // Given: a single-package Cargo.toml with [workspace.metadata.dist], no Cargo.lock.
+        let tmp = tempfile::tempdir()?;
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.2.3\"\n\n[workspace.metadata.dist]\ncargo-dist-version = \"0.22.1\"\n",
+        )?;
+        let b = Cargo;
+        // When: listing files to stage.
+        // Then: only Cargo.toml is returned (no member manifests, no spurious warnings).
+        let files = b.files_to_stage(tmp.path());
+        assert_eq!(files, vec![PathBuf::from("Cargo.toml")]);
+        Ok(())
+    }
+
+    #[test]
+    fn package_with_explicit_empty_members_array_is_publishable() -> Result<()> {
+        // Given: explicit `members = []` plus [package] — boundary case confirming
+        // that workspace_members returns an empty Vec so the new branch in classify
+        // treats this identically to the no-members case.
+        let tmp = tempfile::tempdir()?;
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.3.0\"\n\n[workspace]\nmembers = []\n",
+        )?;
+        let b = Cargo;
+        // When / Then: the package is treated as Layout::Package and is publishable.
+        assert!(b.is_publishable(tmp.path())?);
+        assert_eq!(
+            b.publish_command_preview(tmp.path())?,
+            Some("cargo publish".into())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn virtual_workspace_with_metadata_still_publishes_members() -> Result<()> {
+        // Given: a true virtual workspace (members = ["crates/a"]) that also has
+        // [workspace.metadata.dist]. The presence of metadata must not change the layout.
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/a\"]\n\n[workspace.metadata.dist]\ncargo-dist-version = \"0.22.1\"\n",
+        )?;
+        fs::create_dir_all(root.join("crates/a"))?;
+        fs::write(
+            root.join("crates/a/Cargo.toml"),
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n",
+        )?;
+        let b = Cargo;
+        // When: getting the publish command preview.
+        // Then: the workspace is still VirtualOrMembers; member "a" is published.
+        let preview = b.publish_command_preview(root)?.unwrap_or_default();
+        assert!(
+            preview.contains("cargo publish -p a"),
+            "expected member publish in preview: {preview}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn package_with_workspace_exclude_is_publishable() -> Result<()> {
+        // Given: a single-package Cargo.toml that uses `[workspace] exclude = ["examples"]`
+        // to suppress auto-discovery warnings.  `exclude` is not a multi-package signal —
+        // the package must still be classified as Layout::Package and be publishable.
+        let tmp = tempfile::tempdir()?;
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"1.0.0\"\n\n[workspace]\nexclude = [\"examples\"]\n",
+        )?;
+        let b = Cargo;
+        assert!(b.is_publishable(tmp.path())?);
+        assert_eq!(
+            b.publish_command_preview(tmp.path())?,
+            Some("cargo publish".into())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn package_with_publish_false_and_workspace_metadata_is_not_publishable() -> Result<()> {
+        // Given: [package] with publish = false plus [workspace.metadata.dist].
+        // The new Layout::Package branch must still honour the publish = false field.
+        let tmp = tempfile::tempdir()?;
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.2.3\"\npublish = false\n\n[workspace.metadata.dist]\ncargo-dist-version = \"0.22.1\"\n",
+        )?;
+        let b = Cargo;
+        // When / Then: is_publishable returns false.
+        assert!(!b.is_publishable(tmp.path())?);
+        assert_eq!(b.publish_command_preview(tmp.path())?, None);
         Ok(())
     }
 }
