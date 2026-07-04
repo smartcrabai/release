@@ -101,6 +101,38 @@ are published while non-publishable members are filtered out. The publish step
 runs only when at least one package would actually be published. uv, dotnet,
 julia, and go currently leave publish decisions to the underlying tool itself.
 
+## Disabling publish for a repository (`.release.toml`)
+
+For repositories where the package itself is meant to be published, but
+publishing is handled by CI instead of this tool -- e.g. GitHub Actions using
+OIDC trusted publishing -- add a `.release.toml` file at the project root with:
+
+```toml
+publish = false
+```
+
+When set, the publish step is always skipped, regardless of backend or
+manifest markers. This applies to the normal bump/commit/tag/push/publish flow
+*and* to `--only-publish`, which is skipped gracefully too (it prints a
+message and exits successfully rather than publishing) -- the point is to
+prevent a local `release` invocation from accidentally publishing outside of
+CI's provenance-carrying pipeline. `publish = true` is accepted for
+explicitness but matches the default (publish enabled). A missing
+`.release.toml`, or one without a `publish` key, leaves publish enabled.
+
+`.release.toml` is looked up starting from the current directory and walking
+up through ancestor directories, stopping at (and including) the top level of
+the git repository -- the first ancestor containing a `.git` entry. This means
+a `.release.toml` at the repository root also applies when `release` is run
+from a subdirectory (e.g. a member of a monorepo), while directories outside
+the repository (e.g. your home directory) are never consulted.
+
+Config errors are always fatal and are checked before any bump or git
+operation runs: a `.release.toml` that fails to parse as TOML, whose
+`publish` key is not a boolean, that contains an unknown top-level key, or
+that cannot be read (e.g. it is a directory rather than a file) all abort the
+command immediately, even when `--no-publish` is passed.
+
 ## Git workflow
 
 For every backend the tool:
