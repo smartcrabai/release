@@ -1,5 +1,5 @@
 [package]
-description = ""
+description = "A small Rust CLI for bumping versions, tagging releases, and publishing packages."
 edition = "2024"
 license = "MIT"
 name = "release"
