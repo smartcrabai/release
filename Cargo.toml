@@ -2,9 +2,13 @@
 description = "A small Rust CLI for bumping versions, tagging releases, and publishing packages."
 edition = "2024"
 license = "MIT"
-name = "release"
+name = "smartcrab-release"
 repository = "https://github.com/smartcrabai/release"
 version = "0.1.9"
+
+[[bin]]
+name = "release"
+path = "src/main.rs"
 
 [workspace.metadata.dist]
 cargo-dist-version = "0.31.0"

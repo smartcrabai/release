@@ -20,7 +20,7 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/smartcrabai/release/rel
 ### Cargo
 
 ```sh
-cargo install --git https://github.com/smartcrabai/release
+cargo install smartcrab-release
 ```
 
 ### Prebuilt binaries
