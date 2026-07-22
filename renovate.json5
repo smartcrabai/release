@@ -3,8 +3,8 @@
     "config:best-practices"
   ],
   dependencyDashboard: false,
-  // Files distributed by Terraform must remain unchanged in each repository.
-  // This avoids conflicts with the source of truth, including digest pinning.
+  // Terraform から配布されるファイルは各リポジトリ側で編集させない
+  // （digest ピン付け等で source of truth と綱引きになるのを防ぐ）。
   ignorePaths: [
     ".github/workflows/cruise.yml",
     ".woodpecker/cruise.yaml",
