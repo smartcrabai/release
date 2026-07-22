@@ -131,7 +131,7 @@ pub fn run_with(cli: &Cli, root: &Path) -> Result<()> {
     if cli.no_publish {
         println!("Skipping publish (--no-publish specified).");
     } else {
-        run_publish(backend.as_ref(), root, cli.dry_run, publish_enabled)?;
+        println!("Skipping publish: use --only-publish to publish explicitly.");
     }
 
     Ok(())

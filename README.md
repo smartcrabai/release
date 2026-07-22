@@ -41,12 +41,12 @@ The positional argument defaults to `patch`.
 
 ### Flags
 
-| Flag            | Description                                                                |
-| --------------- | -------------------------------------------------------------------------- |
-| `-P`, `--no-publish` | Skip the publish step (existing `cargo-release` compatibility).       |
-| `-p`, `--only-publish` | Only run the publish step; skip bump/commit/tag/push (mutually exclusive with `--no-publish`). |
-| `--dry-run`     | Print the steps that would run without writing files or running commands. |
-| `--backend <n>` | Override auto-detection. One of `cargo`, `pnpm`, `bun`, `go`, `dotnet`, `julia`, `uv`. |
+| Flag                    | Description                                                                                         |
+| ----------------------- | --------------------------------------------------------------------------------------------------- |
+| `-P`, `--no-publish`    | Skip publishing (also the default; retained for `cargo-release` command compatibility).             |
+| `-p`, `--only-publish`  | Only run the publish step; skip bump/commit/tag/push (mutually exclusive with `--no-publish`).       |
+| `--dry-run`             | Print the steps that would run without writing files or running commands.                            |
+| `--backend <n>`         | Override auto-detection. One of `cargo`, `pnpm`, `bun`, `go`, `dotnet`, `julia`, `uv`.              |
 
 ## Supported package managers
 
@@ -83,9 +83,9 @@ For `bun`, publishable workspace packages are published in dependency order
 in the dependency graph abort the publish step. `pnpm` delegates ordering to
 `pnpm -r publish`, which already publishes in topological order.
 
-## Skipping publish via manifest fields
+## Publish eligibility via manifest fields
 
-In addition to the `--no-publish` flag, the tool honors each package manager's
+When publishing is explicitly requested, the tool honors each package manager's
 native "do not publish" marker. When every package targeted by the publish step
 is marked non-publishable, the step is silently skipped (a friendly notice is
 printed) instead of running and erroring out.
@@ -112,13 +112,11 @@ publish = false
 ```
 
 When set, the publish step is always skipped, regardless of backend or
-manifest markers. This applies to the normal bump/commit/tag/push/publish flow
-*and* to `--only-publish`, which is skipped gracefully too (it prints a
-message and exits successfully rather than publishing) -- the point is to
-prevent a local `release` invocation from accidentally publishing outside of
-CI's provenance-carrying pipeline. `publish = true` is accepted for
-explicitness but matches the default (publish enabled). A missing
-`.release.toml`, or one without a `publish` key, leaves publish enabled.
+manifest markers. This applies to `--only-publish`, which exits successfully
+without publishing. The normal bump/commit/tag/push flow never publishes
+locally, preventing a race with a tag-triggered CI publishing pipeline.
+`publish = true`, a missing `.release.toml`, or a file without a `publish` key
+permits the separate `--only-publish` operation.
 
 `.release.toml` is looked up starting from the current directory and walking
 up through ancestor directories, stopping at (and including) the top level of
@@ -130,8 +128,8 @@ the repository (e.g. your home directory) are never consulted.
 Config errors are always fatal and are checked before any bump or git
 operation runs: a `.release.toml` that fails to parse as TOML, whose
 `publish` key is not a boolean, that contains an unknown top-level key, or
-that cannot be read (e.g. it is a directory rather than a file) all abort the
-command immediately, even when `--no-publish` is passed.
+that cannot be read (e.g. it is a directory rather than a file) aborts the
+command immediately, even when publishing was not requested.
 
 ## Git workflow
 
@@ -143,7 +141,7 @@ For every backend the tool:
 4. Updates the lockfile where applicable.
 5. Stages the manifest (and lockfile), commits as `chore: bump version to X.Y.Z`,
    tags `vX.Y.Z`, and pushes both `main` and the tag to `origin`.
-6. Publishes unless `--no-publish` is passed.
+6. Skips publishing. Use a separate `release --only-publish` invocation only when direct publishing is required.
 
 Under `--dry-run` nothing is written, no external commands run, and no
 git mutations happen -- each intended action is logged as `would run: ...` or

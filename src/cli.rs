@@ -27,8 +27,8 @@ pub struct Cli {
     #[arg(value_enum, default_value_t = BumpArg::Patch)]
     pub bump: BumpArg,
 
-    /// Skip the publish step.
-    #[arg(short = 'P', long)]
+    /// Skip publishing (the default; retained for cargo-release compatibility).
+    #[arg(short = 'P', long, conflicts_with = "only_publish")]
     pub no_publish: bool,
 
     /// Only run the publish step; skip version bump, commit, tag and push.
@@ -42,4 +42,32 @@ pub struct Cli {
     /// Override automatic backend detection.
     #[arg(long, value_enum)]
     pub backend: Option<BackendName>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normal_release_never_requests_publish() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["release"])?;
+        assert!(!cli.no_publish);
+        assert!(!cli.only_publish);
+        Ok(())
+    }
+
+    #[test]
+    fn no_publish_compatibility_flags_are_accepted() -> Result<(), clap::Error> {
+        for flag in ["-P", "--no-publish"] {
+            let cli = Cli::try_parse_from(["release", flag])?;
+            assert!(cli.no_publish);
+            assert!(!cli.only_publish);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn no_publish_conflicts_with_only_publish() {
+        assert!(Cli::try_parse_from(["release", "-P", "--only-publish"]).is_err());
+    }
 }
