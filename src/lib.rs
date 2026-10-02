@@ -111,8 +111,8 @@ pub fn run_with(cli: &Cli, root: &Path) -> Result<()> {
         }
         println!("would run: git commit -m \"{commit_msg}\"");
         println!("would run: git tag {tag}");
-        println!("would run: git push origin main");
-        println!("would run: git push origin {tag}");
+        println!("would run: git push origin refs/heads/main:refs/heads/main");
+        println!("would run: git push origin refs/tags/{tag}:refs/tags/{tag}");
     } else {
         git::add(root, &files).context("git add")?;
         // If there's nothing to stage (e.g. go backend), create an empty
@@ -124,8 +124,12 @@ pub fn run_with(cli: &Cli, root: &Path) -> Result<()> {
             git::commit(root, &commit_msg).context("git commit")?;
         }
         git::tag(root, &tag).context("git tag")?;
-        git::push(root, "origin", "main").context("git push origin main")?;
-        git::push(root, "origin", &tag).with_context(|| format!("git push origin {tag}"))?;
+        // Explicit `src:dst` keeps git from re-resolving the just-written ref,
+        // which can transiently fail on shared/network filesystems.
+        git::push(root, "origin", "refs/heads/main:refs/heads/main")
+            .context("git push origin main")?;
+        git::push(root, "origin", &format!("refs/tags/{tag}:refs/tags/{tag}"))
+            .with_context(|| format!("git push origin {tag}"))?;
     }
 
     if cli.no_publish {
