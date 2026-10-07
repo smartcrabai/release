@@ -989,7 +989,7 @@ mod tests {
             vec!["packages/*".to_owned()]
         );
         let none: Value = serde_json::from_str(r#"{"name":"x"}"#)?;
-        assert!(extract_workspace_patterns(&none).is_empty());
+        assert_eq!(extract_workspace_patterns(&none), Vec::<String>::new());
         Ok(())
     }
 }
