@@ -24,12 +24,11 @@ fn extract_workspace_patterns(json: &Value) -> Vec<String> {
 
     ws.as_array()
         .or_else(|| ws.get("packages").and_then(Value::as_array))
-        .map(|arr| {
+        .map_or_default(|arr| {
             arr.iter()
                 .filter_map(|v| v.as_str().map(str::to_owned))
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 fn bun_child_package_jsons(root: &Path) -> Result<Vec<PathBuf>> {
@@ -79,7 +78,7 @@ fn collect_publishable_packages(root: &Path) -> Result<Vec<PublishablePkg>> {
         candidates.push((PathBuf::new(), root_pkg));
     }
     for rel in bun_child_package_jsons(root)? {
-        let parent = rel.parent().map(Path::to_path_buf).unwrap_or_default();
+        let parent = rel.parent().map_or_default(Path::to_path_buf);
         candidates.push((parent, root.join(&rel)));
     }
 
